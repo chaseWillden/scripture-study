@@ -48,6 +48,37 @@ pub fn compose(painter: &Painter, center: Pos2, color: Color32) {
     );
 }
 
+/// An open book.
+pub fn book(painter: &Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(WIDTH, color);
+    let p = |x: f32, y: f32| center + vec2(x, y);
+    painter.line(
+        vec![
+            p(0.0, -6.2),
+            p(-7.2, -4.6),
+            p(-7.2, 5.4),
+            p(0.0, 7.0),
+            p(7.2, 5.4),
+            p(7.2, -4.6),
+            p(0.0, -6.2),
+        ],
+        stroke,
+    );
+}
+
+/// A chevron pointing left ("back").
+pub fn chevron_left(painter: &Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(WIDTH, color);
+    painter.line(
+        vec![
+            center + vec2(1.5, -3.5),
+            center + vec2(-2.0, 0.0),
+            center + vec2(1.5, 3.5),
+        ],
+        stroke,
+    );
+}
+
 /// A page with lines of text ("all notes").
 pub fn notes(painter: &Painter, center: Pos2, color: Color32) {
     let stroke = Stroke::new(WIDTH, color);

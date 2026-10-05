@@ -12,6 +12,7 @@ mod library;
 mod link_menu;
 mod menu;
 mod meta;
+mod reader;
 mod scripture_menu;
 mod shortcuts;
 mod sidebar;

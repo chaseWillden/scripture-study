@@ -27,6 +27,10 @@ impl Fixture {
 
     /// Starts with these notes on disk; the last one is the most recent.
     fn with_notes(notes: &[(&str, &str)]) -> Self {
+        Self::with_notes_sized(egui::vec2(1000.0, 640.0), notes)
+    }
+
+    fn with_notes_sized(size: egui::Vec2, notes: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let start = SystemTime::now() - Duration::from_secs(3 * 86_400);
         for (n, (id, markdown)) in notes.iter().enumerate() {
@@ -38,11 +42,9 @@ impl Fixture {
             file.set_modified(modified).unwrap();
         }
         let path = dir.path().to_path_buf();
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(1000.0, 640.0))
-            .build_eframe(move |cc| {
-                ScriptureStudyApp::new(cc, scripture_study_core::FsStore::open(&path).unwrap()).unwrap()
-            });
+        let mut harness = Harness::builder().with_size(size).build_eframe(move |cc| {
+            ScriptureStudyApp::new(cc, scripture_study_core::FsStore::open(&path).unwrap()).unwrap()
+        });
         harness.run();
         Self { dir, harness }
     }
@@ -203,6 +205,77 @@ fn clicking_a_menu_item_runs_it() {
     f.type_text("item");
     assert_eq!(f.kinds(), [BlockKind::Bullet]);
     assert_eq!(f.texts(), ["item"]);
+}
+
+#[test]
+fn star_or_dash_starts_a_bullet() {
+    let mut f = Fixture::new();
+    f.type_text("*");
+    f.type_text(" ");
+    assert_eq!(f.kinds(), [BlockKind::Bullet]);
+    assert_eq!(f.texts(), [""]);
+    f.type_text("milk");
+    assert_eq!(f.texts(), ["milk"]);
+
+    f.press(Key::Enter);
+    f.press(Key::Enter); // empty item leaves the list
+    f.type_text("-");
+    f.type_text(" ");
+    f.type_text("eggs");
+    assert_eq!(f.kinds(), [BlockKind::Bullet, BlockKind::Bullet]);
+    assert_eq!(f.texts(), ["milk", "eggs"]);
+
+    // A marker at the start of a new line inside a paragraph.
+    f.press(Key::Enter);
+    f.press(Key::Enter);
+    f.type_text("Keep");
+    f.harness
+        .key_press_modifiers(egui::Modifiers::SHIFT, Key::Enter);
+    f.harness.run();
+    f.type_text("* ");
+    f.type_text("item");
+    assert_eq!(
+        f.kinds(),
+        [
+            BlockKind::Bullet,
+            BlockKind::Bullet,
+            BlockKind::Paragraph,
+            BlockKind::Bullet
+        ]
+    );
+    assert_eq!(f.texts(), ["milk", "eggs", "Keep", "item"]);
+}
+
+#[test]
+fn text_reflows_when_the_window_widens() {
+    let body = format!("{}end", "brethren ".repeat(70));
+    let markdown = format!("# Title\n\n{body}\n");
+    let mut narrow = Fixture::with_notes_sized(egui::vec2(1000.0, 800.0), &[("note", &markdown)]);
+    let mut wide = Fixture::with_notes_sized(egui::vec2(1700.0, 800.0), &[("note", &markdown)]);
+    for fixture in [&mut narrow, &mut wide] {
+        fixture
+            .harness
+            .ctx
+            .all_styles_mut(|style| style.animation_time = 0.0);
+        fixture.shortcut(Key::Backslash);
+    }
+    let rect = |fixture: &Fixture| fixture.harness.get_by_value(&body).rect();
+    let narrow_r = rect(&narrow);
+    let wide_r = rect(&wide);
+    assert!(
+        wide_r.height() < narrow_r.height(),
+        "wider window should unwrap lines ({} vs {})",
+        wide_r.height(),
+        narrow_r.height()
+    );
+    // Rail is 52 wide and the sidebar is closed. The page keeps its margin
+    // on both sides, past where the paragraph numbers hang.
+    let left_inset = narrow_r.left() - 52.0;
+    let right_inset = 1000.0 - narrow_r.right();
+    assert!(
+        left_inset >= 60.0 && right_inset >= 60.0,
+        "page should sit in from both edges (left {left_inset}, right {right_inset})"
+    );
 }
 
 #[test]
@@ -471,7 +544,7 @@ fn collapsed_sidebar_keeps_the_icon_rail() {
     f.click("Hide notes");
     assert!(!f.app().sidebar.open);
     assert!(f.harness.query_by_label("Groceries").is_none());
-    for label in ["Show notes", "Search notes", "New note"] {
+    for label in ["Show notes", "Scriptures", "Search notes", "New note"] {
         assert!(f.harness.query_by_label(label).is_some(), "{label} missing");
     }
     f.snapshot("rail_collapsed");
@@ -944,7 +1017,10 @@ fn shift_up_extends_the_selection_row_by_row_across_blocks() {
         .key_press_modifiers(egui::Modifiers::SHIFT, Key::ArrowUp);
     f.harness.run();
     let sel = selection(&f).expect("selection into the block above");
-    assert_eq!(sel.anchor, scripture_study_core::editor::Caret { block: 2, char: 11 });
+    assert_eq!(
+        sel.anchor,
+        scripture_study_core::editor::Caret { block: 2, char: 11 }
+    );
     assert_eq!(sel.head.block, 1);
 
     f.harness
@@ -989,7 +1065,10 @@ fn shift_left_at_the_start_of_a_block_crosses_over() {
         .key_press_modifiers(egui::Modifiers::SHIFT, Key::ArrowLeft);
     f.harness.run();
     let sel = selection(&f).unwrap();
-    assert_eq!(sel.head, scripture_study_core::editor::Caret { block: 1, char: 10 });
+    assert_eq!(
+        sel.head,
+        scripture_study_core::editor::Caret { block: 1, char: 10 }
+    );
 
     // Plain arrows collapse the selection and put the caret back.
     f.press(Key::ArrowRight);
@@ -1995,7 +2074,14 @@ fn slash_scripture_cites_the_reference_instead_of_a_number() {
     f.type_text("The brother of Jared");
     f.type_text(" /scripture");
     f.press(Key::Enter);
+    f.snapshot("scripture_picker");
     f.type_text("Ether 2:1-4");
+    f.snapshot("scripture_picker_results");
+    f.harness.ctx.set_theme(egui::Theme::Light);
+    f.harness.run();
+    f.snapshot("scripture_picker_results_light");
+    f.harness.ctx.set_theme(egui::Theme::Dark);
+    f.harness.run();
     f.press(Key::Enter);
 
     assert_eq!(f.texts(), ["The brother of Jared [^Ether 2:1-4]"]);
@@ -2288,4 +2374,112 @@ fn a_bare_address_converts_to_just_a_number() {
     }
     f.press(Key::Enter);
     assert_eq!(f.texts(), ["See[^1] for more"]);
+}
+
+#[test]
+fn scriptures_page_opens_a_book_then_its_chapter() {
+    let mut f = Fixture::with_note("# Note\n\nKeep me.\n");
+    f.click("Scriptures");
+    assert!(f.app().scriptures.is_open());
+    // The book icon takes over the sidebar. Notes is no longer the selected rail item.
+    assert!(f.harness.query_by_label("Hide notes").is_none());
+    assert!(f.harness.query_by_label("Show notes").is_some());
+    assert!(f.harness.query_by_label("Genesis").is_some());
+    f.snapshot("scriptures");
+    assert!(f.harness.query_by_label("1 Nephi").is_some());
+    assert!(f.harness.query_by_label("Moses").is_some());
+
+    f.click("Genesis");
+    assert!(f.harness.query_by_label("Chapter 1").is_some());
+    assert!(f.harness.query_by_label("Chapter 50").is_some());
+    f.snapshot("scriptures_chapters");
+
+    f.click("Chapter 1");
+    let verse = "In the beginning God created the heaven and the earth.";
+    let last = "And God saw every thing that he had made, and, behold, it was very good. And the evening and the morning were the sixth day.";
+    assert!(f.harness.query_by_label(verse).is_some());
+    assert!(
+        f.harness.query_by_label(last).is_some(),
+        "the whole chapter is on the page"
+    );
+    assert!(f.harness.query_by_label("Chapter 2").is_none());
+    f.snapshot("scriptures_chapter");
+
+    // Typing stays out of the note underneath.
+    f.type_text("hello");
+    assert_eq!(f.texts(), ["Note", "Keep me."]);
+
+    f.click("Next chapter");
+    assert!(f
+        .harness
+        .query_by_label("Thus the heavens and the earth were finished, and all the host of them.")
+        .is_some());
+    f.click("Previous chapter");
+    assert!(f.harness.query_by_label(verse).is_some());
+
+    f.click("Back");
+    assert!(f.harness.query_by_label("Chapter 2").is_some());
+    f.press(Key::Escape);
+    assert!(f.harness.query_by_label("Exodus").is_some());
+    f.press(Key::Escape);
+    assert!(!f.app().scriptures.is_open());
+    assert_eq!(f.texts(), ["Note", "Keep me."]);
+
+    // The book icon returns to the same place, and a note leaves it.
+    f.click("Scriptures");
+    assert!(f.harness.query_by_label("Exodus").is_some());
+    f.harness
+        .get_by_label("Doctrine and Covenants")
+        .scroll_to_me();
+    f.harness.run();
+    f.click("Doctrine and Covenants");
+    assert!(f.harness.query_by_label("Section 4").is_some());
+    assert!(f.harness.query_by_label("Section 138").is_some());
+    f.click("Section 4");
+    assert!(f
+        .harness
+        .query_by_label(
+            "Now behold, a marvelous work is about to come forth among the children of men."
+        )
+        .is_some());
+    f.click("Show notes");
+    assert!(!f.app().scriptures.is_open());
+    assert!(f.harness.query_by_label("Hide notes").is_some());
+    assert!(f.harness.query_by_label("Genesis").is_none());
+    assert_eq!(f.texts(), ["Note", "Keep me."]);
+}
+
+#[test]
+fn scriptures_filter_and_search() {
+    let mut f = Fixture::with_note("# Note\n\nKeep me.\n");
+    f.click("Scriptures");
+
+    f.harness
+        .get_by(|node| node.placeholder() == Some("Filter books"))
+        .click();
+    f.harness.run();
+    f.type_text("gene");
+    assert!(f.harness.query_by_label("Genesis").is_some());
+    assert!(
+        f.harness.query_by_label("Exodus").is_none(),
+        "the book list narrows as you type"
+    );
+    f.press(Key::Escape);
+    assert!(
+        f.harness.query_by_label("Exodus").is_some(),
+        "escape clears the filter"
+    );
+
+    f.harness
+        .get_by(|node| node.placeholder() == Some("Search scriptures"))
+        .click();
+    f.harness.run();
+    f.type_text("in the beginning god created");
+    assert!(f.harness.query_by_label("Genesis 1:1").is_some());
+    f.click("Genesis 1:1");
+    assert!(f
+        .harness
+        .query_by_label("In the beginning God created the heaven and the earth.")
+        .is_some());
+    assert_eq!(f.texts(), ["Note", "Keep me."]);
 }

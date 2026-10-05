@@ -48,8 +48,7 @@ pub fn menu_at<R>(
     just_opened: bool,
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> (R, bool) {
-    let mut style = (*ctx.global_style()).clone();
-    apply_style(&mut style, palette);
+    let style = popup_style(ctx, palette);
     let area = egui::Area::new(id)
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
@@ -72,7 +71,14 @@ pub fn menu_at<R>(
     (area.inner, open)
 }
 
-fn apply_style(style: &mut egui::Style, palette: &Palette) {
+/// The context menu's popup style, so other pickers can share its chrome.
+pub fn popup_style(ctx: &egui::Context, palette: &Palette) -> egui::Style {
+    let mut style = (*ctx.global_style()).clone();
+    apply_style(&mut style, palette);
+    style
+}
+
+pub(crate) fn apply_style(style: &mut egui::Style, palette: &Palette) {
     let dark = style.visuals.dark_mode;
     style.spacing.menu_margin = Margin::same(5);
     style.spacing.item_spacing = vec2(0.0, 1.0);

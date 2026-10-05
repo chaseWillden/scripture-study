@@ -304,7 +304,8 @@ impl Editor {
         let indent = match block.kind {
             BlockKind::Paragraph => {
                 let last_line = block.text.rsplit('\n').next().unwrap_or("");
-                ops::leading_tabs(last_line).min(scripture_study_core::document::MAX_INDENT as usize) as u8
+                ops::leading_tabs(last_line)
+                    .min(scripture_study_core::document::MAX_INDENT as usize) as u8
             }
             _ => block.indent,
         };
@@ -446,6 +447,9 @@ impl Editor {
         let selection_color = ui.visuals().selection.bg_fill;
         let mut menu: Option<OpenMenu> = None;
         let numbers = self.doc.paragraph_numbers();
+        // Applied after the loop so splitting a line into blocks doesn't
+        // shift the ones still being drawn.
+        let mut markdown_shortcut = None;
 
         for i in 0..self.doc.blocks.len() {
             let id = self.block_id(i);
@@ -712,16 +716,11 @@ impl Editor {
             if output.response.changed() {
                 events.push(Event::Changed);
                 self.menu_selected = 0;
-                let block = &mut self.doc.blocks[i];
-                let before = block.text.chars().count();
-                if ops::apply_markdown_shortcut(block) {
-                    let removed = before - block.text.chars().count();
-                    let caret = selection.map_or(0, |(s, _)| s + 1).saturating_sub(removed);
-                    op = Some(Op::Focus(Caret {
-                        block: i,
-                        char: caret,
-                    }));
-                }
+                let caret = output
+                    .cursor_range
+                    .map(|range| range.primary.index.0)
+                    .unwrap_or_else(|| selection.map_or(0, |(start, _)| start + 1));
+                markdown_shortcut = Some((i, caret));
             }
 
             if let (Some(query), Some(matches)) = (slash, matches) {
@@ -847,6 +846,14 @@ impl Editor {
                     query: menu.query,
                     action,
                 });
+            }
+        }
+
+        if op.is_none() {
+            if let Some((index, caret)) = markdown_shortcut {
+                if let Some(caret) = ops::apply_markdown_shortcut(&mut self.doc, index, caret) {
+                    op = Some(Op::Focus(caret));
+                }
             }
         }
 

@@ -1,5 +1,5 @@
 //! Note lifecycle (which note is open, autosave, note commands) and the
-//! window layout: title bar, sidebar, and editor.
+//! window layout: title bar, sidebar, editor, and the scriptures page.
 
 use std::time::SystemTime;
 
@@ -15,6 +15,7 @@ use scripture_study_core::{
 
 use crate::editor::{Editor, Event};
 use crate::meta::NoteTimes;
+use crate::reader::Reader;
 use crate::shortcuts::{
     DELETE_NOTE, FIND, NEW_FOLDER, NEW_NOTE, OPEN_FOLDER, RENAME, REVEAL, SAVE, SEARCH,
     TOGGLE_SIDEBAR, TOGGLE_SIDEBAR_SHIFT_B,
@@ -52,6 +53,7 @@ pub struct ScriptureStudyApp {
     tree: Folder,
     current: String,
     sidebar: Sidebar,
+    scriptures: Reader,
     editor: Editor,
     commands: Vec<Command>,
     /// egui time of the first unsaved edit.
@@ -70,6 +72,8 @@ pub struct ScriptureStudyApp {
     /// Whether text was pasted since the V key went down.
     text_pasted: bool,
     error: Option<String>,
+    /// Eased width of the page column. `0` until the first frame.
+    page_width: f32,
 }
 
 impl ScriptureStudyApp {
@@ -89,6 +93,7 @@ impl ScriptureStudyApp {
             editor: Editor::new(&current, doc),
             current,
             sidebar: Sidebar::default(),
+            scriptures: Reader::default(),
             commands: Vec::new(),
             dirty_since: None,
             error: None,
@@ -98,6 +103,7 @@ impl ScriptureStudyApp {
             remember_library: crate::library::remember,
             v_down: false,
             text_pasted: false,
+            page_width: 0.0,
         };
         app.refresh_notes();
         Ok(app)
@@ -160,6 +166,7 @@ impl ScriptureStudyApp {
             Ok(doc) => {
                 self.editor = Editor::new(&id, doc);
                 self.sidebar.reveal(store::parent(&id));
+                self.scriptures.close();
                 self.current = id;
             }
             Err(e) => self.error = Some(format!("Couldn't open note: {e}")),
@@ -238,6 +245,10 @@ impl ScriptureStudyApp {
             .title()
             .unwrap_or_else(|| UNTITLED.to_string())
     }
+
+    fn window_title(&self) -> String {
+        self.scriptures.title().unwrap_or_else(|| self.title())
+    }
 }
 
 impl ScriptureStudyApp {
@@ -251,6 +262,7 @@ impl ScriptureStudyApp {
         }
         if !menu_open && ui.input_mut(|i| i.consume_shortcut(&NEW_FOLDER)) {
             self.sidebar.new_folder();
+            self.scriptures.close();
         }
         // ⌥⌘R before ⌘R, which also matches with Option held.
         if !menu_open && ui.input_mut(|i| i.consume_shortcut(&REVEAL)) {
@@ -268,9 +280,11 @@ impl ScriptureStudyApp {
         }
         if ui.input_mut(|i| i.consume_shortcut(&SEARCH)) {
             self.sidebar.start_search();
+            self.scriptures.close();
         }
         // Cmd+F finds within the open note; Cmd+K searches every note.
-        if ui.input_mut(|i| i.consume_shortcut(&FIND)) {
+        // The scriptures page has no find bar, so the shortcut waits.
+        if !self.scriptures.is_open() && ui.input_mut(|i| i.consume_shortcut(&FIND)) {
             self.editor.find.open();
         }
         // On macOS the menu bar takes ⌘O and reports it here.
@@ -299,11 +313,11 @@ impl ScriptureStudyApp {
             .frame(Frame::new().fill(palette.rail))
             .show(ui, |ui| {
                 ui.add_space(TITLEBAR_HEIGHT);
-                self.sidebar.rail(ui, palette)
+                self.sidebar.rail(ui, palette, self.scriptures.is_open())
             })
             .inner;
-        if let Some(SidebarAction::New) = action {
-            self.run(Action::NewNote);
+        if let Some(action) = action {
+            self.sidebar_action(action);
         }
     }
 
@@ -320,15 +334,20 @@ impl ScriptureStudyApp {
             .frame(Frame::new().fill(palette.sidebar))
             .show_collapsible(ui, &mut expanded, |ui| {
                 ui.add_space(TITLEBAR_HEIGHT);
-                let title = self.title();
-                let notes = sidebar::Notes {
-                    index: &self.index,
-                    current: &self.current,
-                    current_title: &title,
-                    now: SystemTime::now(),
-                    tree: &self.tree,
-                };
-                self.sidebar.show(ui, &notes, palette)
+                if self.scriptures.is_open() {
+                    self.scriptures.show_index(ui, palette);
+                    None
+                } else {
+                    let title = self.title();
+                    let notes = sidebar::Notes {
+                        index: &self.index,
+                        current: &self.current,
+                        current_title: &title,
+                        now: SystemTime::now(),
+                        tree: &self.tree,
+                    };
+                    self.sidebar.show(ui, &notes, palette)
+                }
             });
         let visible = shown.is_some();
         if visible != self.sidebar.panel_visible() {
@@ -352,6 +371,19 @@ impl ScriptureStudyApp {
             }
             SidebarAction::New => {
                 self.run(Action::NewNote);
+                return;
+            }
+            SidebarAction::OpenScriptures => {
+                self.scriptures.ensure_open();
+                return;
+            }
+            SidebarAction::ShowNotes => {
+                self.scriptures.close();
+                self.sidebar.show_recent();
+                return;
+            }
+            SidebarAction::CloseScriptures => {
+                self.scriptures.close();
                 return;
             }
             SidebarAction::NewIn(folder) => self.store.create_in(&folder).map(|id| self.open(id)),
@@ -507,6 +539,22 @@ impl ScriptureStudyApp {
         Ok(())
     }
 
+    fn show_scriptures(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let index_open = self.sidebar.open;
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            ui.painter()
+                .rect_filled(ui.max_rect(), 0.0, palette.background);
+            let full = ui.max_rect();
+            let mut column = self.page_column(ui, full);
+            let top = full.top() + TITLEBAR_HEIGHT + 16.0;
+            column.min.y = top;
+            column.max.y = full.bottom();
+            ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
+                self.scriptures.show_reading(ui, palette, index_open);
+            });
+        });
+    }
+
     fn show_editor(&mut self, ui: &mut egui::Ui, palette: &Palette) -> Vec<Event> {
         let dir = self
             .store
@@ -523,11 +571,7 @@ impl ScriptureStudyApp {
                     .show(ui, |ui| {
                         ui.add_space(80.0);
                         let full = ui.available_rect_before_wrap();
-                        let width = theme::CONTENT_WIDTH.min(full.width() - 48.0);
-                        let column = Rect::from_min_size(
-                            pos2(full.center().x - width / 2.0, full.top()),
-                            vec2(width, full.height()),
-                        );
+                        let column = self.page_column(ui, full);
                         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
                             self.editor.show(ui, &self.commands, times, &dir)
                         })
@@ -539,6 +583,23 @@ impl ScriptureStudyApp {
                 events
             })
             .inner
+    }
+
+    /// Page column for `area`. The left edge stays put; the width eases toward
+    /// the size that leaves [`theme::PAGE_MARGIN`] on both sides.
+    fn page_column(&mut self, ui: &egui::Ui, area: Rect) -> Rect {
+        let ppp = ui.pixels_per_point().max(0.01);
+        let target = (theme::column_width(area.width()) * ppp).round() / ppp;
+        let dt = ui.input(|i| i.stable_dt);
+        if theme::ease_width(&mut self.page_width, target, dt) {
+            ui.ctx().request_repaint();
+        }
+        let width = (self.page_width * ppp).round() / ppp;
+        let margin = (area.width() - target).max(0.0) * 0.5;
+        Rect::from_min_size(
+            pos2(area.left() + margin, area.top()),
+            vec2(width.max(0.0), area.height()),
+        )
     }
 
     /// The window-control strip: drag to move, double-click to zoom, plus the
@@ -711,15 +772,24 @@ fn clipboard_png() -> Option<Vec<u8>> {
 impl eframe::App for ScriptureStudyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let palette = Palette::for_ui(ui);
-        let title_before = self.title();
+        let title_before = self.window_title();
 
         self.shortcuts(ui);
-        self.add_images(ui);
+        if !self.scriptures.is_open() {
+            self.add_images(ui);
+        }
         self.show_rail(ui, &palette);
         self.show_sidebar(ui, &palette);
-        let events = self.show_editor(ui, &palette);
+        let events = if self.scriptures.is_open() {
+            self.show_scriptures(ui, &palette);
+            Vec::new()
+        } else {
+            self.show_editor(ui, &palette)
+        };
         self.title_bar(ui, &palette);
-        self.drop_hint(ui, &palette);
+        if !self.scriptures.is_open() {
+            self.drop_hint(ui, &palette);
+        }
 
         let now = ui.input(|i| i.time);
         for event in events {
@@ -753,7 +823,7 @@ impl eframe::App for ScriptureStudyApp {
                 });
         }
 
-        let title = self.title();
+        let title = self.window_title();
         if title != title_before || ui.ctx().cumulative_frame_nr() == 0 {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Title(title));

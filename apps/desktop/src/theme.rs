@@ -14,8 +14,50 @@ use scripture_study_core::{inline, BlockKind};
 const INTER: &[u8] = include_bytes!("../assets/fonts/Inter.ttf");
 const INTER_ITALIC: &[u8] = include_bytes!("../assets/fonts/Inter-Italic.ttf");
 
-pub const CONTENT_WIDTH: f32 = 680.0;
+/// Space kept on each side of the page column. Paragraph numbers hang to
+/// the left of the text, so this is wide enough that they stay clear of the
+/// sidebar and the window edge.
+pub const PAGE_MARGIN: f32 = 72.0;
 pub const GUTTER: f32 = 28.0;
+
+/// Width of the page column. It grows with the window so wrapped text
+/// reflows, and keeps a margin from the edges.
+pub fn column_width(available: f32) -> f32 {
+    (available - PAGE_MARGIN * 2.0).max(0.0)
+}
+
+/// Moves `current` toward `target`. Returns whether another frame is needed.
+///
+/// The first width, and a jump large enough to be the sidebar rather than a
+/// resize, land immediately. A resize eases, and never trails the window by
+/// more than [`MAX_LAG`], so line breaks don't flip on every pixel and the
+/// column still stays inside the margins.
+const MAX_LAG: f32 = 32.0;
+
+pub fn ease_width(current: &mut f32, target: f32, dt: f32) -> bool {
+    const SNAP: f32 = 160.0;
+    const TAU: f32 = 0.08;
+    const DONE: f32 = 0.4;
+
+    // A big dt is a stalled frame or a test step, not a drag. Catch up at once
+    // so the column doesn't keep requesting frames after the window has settled.
+    if *current <= 0.0 || (target - *current).abs() >= SNAP || dt >= 0.2 {
+        *current = target;
+        return false;
+    }
+    let delta = target - *current;
+    if delta.abs() <= DONE {
+        *current = target;
+        return false;
+    }
+    let t = 1.0 - (-dt.max(0.0) / TAU).exp();
+    *current += delta * t;
+    let lag = target - *current;
+    if lag.abs() > MAX_LAG {
+        *current = target - lag.signum() * MAX_LAG;
+    }
+    (target - *current).abs() > DONE
+}
 
 pub fn italic_family() -> FontFamily {
     FontFamily::Name("italic".into())
@@ -134,7 +176,8 @@ pub fn tag_colors(ui: &egui::Ui, name: &str) -> (Color32, Color32) {
     } else {
         &TAG_COLORS_LIGHT
     };
-    let ((br, bg, bb), (fr, fg, fb)) = table[scripture_study_core::properties::color_slot(name, table.len())];
+    let ((br, bg, bb), (fr, fg, fb)) =
+        table[scripture_study_core::properties::color_slot(name, table.len())];
     (Color32::from_rgb(br, bg, bb), Color32::from_rgb(fr, fg, fb))
 }
 
@@ -379,4 +422,31 @@ fn layout_indented_lines(ui: &egui::Ui, job: LayoutJob) -> Arc<egui::Galley> {
         &parts,
         pixels_per_point,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ease_width;
+
+    #[test]
+    fn ease_width_snaps_the_first_frame_and_big_jumps() {
+        let mut width = 0.0;
+        assert!(!ease_width(&mut width, 640.0, 1.0 / 60.0));
+        assert_eq!(width, 640.0);
+
+        // The sidebar opens and closes in one step.
+        assert!(!ease_width(&mut width, 400.0, 1.0 / 60.0));
+        assert_eq!(width, 400.0);
+    }
+
+    #[test]
+    fn ease_width_follows_a_resize_without_jumping_to_it() {
+        let mut width = 640.0;
+        assert!(ease_width(&mut width, 670.0, 1.0 / 60.0));
+        assert!(width > 640.0 && width < 670.0, "{width}");
+
+        let mut stepped = 640.0;
+        assert!(!ease_width(&mut stepped, 670.0, 0.25));
+        assert_eq!(stepped, 670.0);
+    }
 }

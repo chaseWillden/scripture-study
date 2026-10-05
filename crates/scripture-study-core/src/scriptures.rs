@@ -46,6 +46,8 @@ struct Book {
     /// Index range into [`Catalog::verses`].
     start: usize,
     end: usize,
+    /// Highest chapter number. Chapters in the bundled text run `1..=chapters`.
+    chapters: u16,
 }
 
 struct Catalog {
@@ -77,7 +79,7 @@ impl Catalog {
                 .is_none_or(|book| book.title != item.book_title);
             if new_book {
                 if let Some(book) = books.last_mut() {
-                    book.end = verses.len();
+                    close_book(book, &verses);
                 }
                 books.push(Book::new(
                     item.book_title,
@@ -102,7 +104,7 @@ impl Catalog {
             });
         }
         if let Some(book) = books.last_mut() {
-            book.end = verses.len();
+            close_book(book, &verses);
         }
         Self { books, verses }
     }
@@ -394,8 +396,17 @@ impl Book {
             aliases,
             start,
             end: start,
+            chapters: 0,
         }
     }
+}
+
+fn close_book(book: &mut Book, verses: &[Verse]) {
+    book.end = verses.len();
+    book.chapters = verses[book.start..book.end]
+        .last()
+        .map(|verse| verse.chapter)
+        .unwrap_or(0);
 }
 
 fn extra_aliases(title: &str) -> &'static [&'static str] {
@@ -607,6 +618,172 @@ pub fn search(query: &str) -> Vec<Hit> {
     catalog().search(query)
 }
 
+/// One verse found by [`find_verses`], best matches first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerseHit {
+    pub book: String,
+    pub chapter: u16,
+    pub number: u16,
+    pub label: String,
+    /// Short verse text for a result row.
+    pub preview: String,
+}
+
+/// The best scripture matches for `query`, at most ten.
+///
+/// A reference (`Ether 2:1`, `D&C 4`) wins. Otherwise the words are matched
+/// against the verse text, so a partial phrase still finds the verse.
+pub fn find_verses(query: &str) -> Vec<VerseHit> {
+    const LIMIT: usize = 10;
+    search(query)
+        .into_iter()
+        .filter_map(|hit| {
+            let (book, chapter, number) = locate(&hit.label)?;
+            Some(VerseHit {
+                book,
+                chapter,
+                number,
+                label: hit.label,
+                preview: hit.preview,
+            })
+        })
+        .take(LIMIT)
+        .collect()
+}
+
+/// `Genesis 1:1` or `Ether 2:1-4` into book, chapter, and the first verse.
+fn locate(label: &str) -> Option<(String, u16, u16)> {
+    let (head, verses) = label.rsplit_once(':')?;
+    let number: u16 = verses.split(['-', '–', '—']).next()?.trim().parse().ok()?;
+    let (book, chapter) = head.rsplit_once(' ')?;
+    let chapter: u16 = chapter.parse().ok()?;
+    if book.is_empty() {
+        return None;
+    }
+    Some((book.to_string(), chapter, number))
+}
+
+/// One volume in standard order, with the books that belong to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Volume {
+    pub title: String,
+    pub books: Vec<BookSummary>,
+}
+
+/// A book someone can open and read chapter by chapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BookSummary {
+    pub title: String,
+    pub volume: String,
+    /// Highest chapter (or section) number. Numbers run from 1.
+    pub chapters: u16,
+}
+
+/// One verse of a chapter, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerseText {
+    pub number: u16,
+    pub text: String,
+}
+
+/// Every verse of one chapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Passage {
+    pub book: String,
+    pub volume: String,
+    pub number: u16,
+    /// How many chapters the book has, so the reader can move to the next one.
+    pub count: u16,
+    pub verses: Vec<VerseText>,
+}
+
+/// Volumes and their books, in the order the scriptures are usually printed.
+pub fn volumes() -> Vec<Volume> {
+    volumes_matching("")
+}
+
+/// Volumes, keeping only books whose name or abbreviation matches `query`.
+/// An empty query keeps every book. Volumes with nothing left are dropped.
+pub fn volumes_matching(query: &str) -> Vec<Volume> {
+    let query = normalize(query);
+    let mut out: Vec<Volume> = Vec::new();
+    for book in &catalog().books {
+        if !book_matches(book, &query) {
+            continue;
+        }
+        if out.last().is_none_or(|volume| volume.title != book.volume) {
+            out.push(Volume {
+                title: book.volume.clone(),
+                books: Vec::new(),
+            });
+        }
+        out.last_mut().expect("volume").books.push(summarize(book));
+    }
+    out
+}
+
+fn book_matches(book: &Book, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let title = book.title.to_lowercase();
+    if title.contains(query) {
+        return true;
+    }
+    let compact_query = compact(query);
+    if !compact_query.is_empty() && compact(&title).contains(&compact_query) {
+        return true;
+    }
+    book.aliases.iter().any(|alias| {
+        alias_score(alias, query, &compact_query) > 0
+            || (!compact_query.is_empty() && alias.contains(&compact_query))
+    })
+}
+
+/// One book, by its full title (`Genesis`, `Doctrine and Covenants`).
+pub fn book(title: &str) -> Option<BookSummary> {
+    catalog()
+        .books
+        .iter()
+        .find(|book| book.title == title)
+        .map(summarize)
+}
+
+/// Every verse of `number` in `title`, or `None` when the book or chapter is missing.
+pub fn chapter(title: &str, number: u16) -> Option<Passage> {
+    let catalog = catalog();
+    let book = catalog.books.iter().find(|item| item.title == title)?;
+    if number == 0 || number > book.chapters {
+        return None;
+    }
+    let verses: Vec<VerseText> = catalog.verses[book.start..book.end]
+        .iter()
+        .filter(|verse| verse.chapter == number)
+        .map(|verse| VerseText {
+            number: verse.number,
+            text: verse.text.clone(),
+        })
+        .collect();
+    if verses.is_empty() {
+        return None;
+    }
+    Some(Passage {
+        book: book.title.clone(),
+        volume: book.volume.clone(),
+        number,
+        count: book.chapters,
+        verses,
+    })
+}
+
+fn summarize(book: &Book) -> BookSummary {
+    BookSummary {
+        title: book.title.clone(),
+        volume: book.volume.clone(),
+        chapters: book.chapters,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,5 +836,81 @@ mod tests {
         let hits = search("Ether 2");
         assert_eq!(hits[0].label, "Ether 2:1");
         assert!(hits.iter().any(|hit| hit.label == "Ether 2:4"));
+    }
+
+    #[test]
+    fn volumes_list_every_book_in_print_order() {
+        let volumes = volumes();
+        assert_eq!(
+            volumes
+                .iter()
+                .map(|volume| volume.title.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Old Testament",
+                "New Testament",
+                "Book of Mormon",
+                "Doctrine and Covenants",
+                "Pearl of Great Price",
+            ]
+        );
+        assert_eq!(volumes[0].books.len(), 39);
+        assert_eq!(volumes[0].books[0].title, "Genesis");
+        assert_eq!(volumes[0].books[0].chapters, 50);
+        assert_eq!(volumes[2].books.len(), 15);
+        assert_eq!(volumes[3].books[0].chapters, 138);
+        assert_eq!(book("Obadiah").unwrap().chapters, 1);
+        assert!(book("Missing").is_none());
+    }
+
+    #[test]
+    fn chapter_returns_the_whole_chapter() {
+        let genesis = chapter("Genesis", 1).unwrap();
+        assert_eq!(genesis.volume, "Old Testament");
+        assert_eq!(genesis.count, 50);
+        assert_eq!(genesis.verses.len(), 31);
+        assert_eq!(genesis.verses[0].number, 1);
+        assert_eq!(
+            genesis.verses[0].text,
+            "In the beginning God created the heaven and the earth."
+        );
+        assert_eq!(
+            genesis.verses[30].text,
+            "And God saw every thing that he had made, and, behold, it was very good. And the evening and the morning were the sixth day."
+        );
+        assert!(chapter("Genesis", 51).is_none());
+        assert!(chapter("Missing", 1).is_none());
+
+        let found = find_verses("in the beginning god created");
+        assert_eq!(found[0].label, "Genesis 1:1");
+        assert_eq!(found[0].book, "Genesis");
+        assert_eq!(found[0].chapter, 1);
+        assert_eq!(found[0].number, 1);
+        assert_eq!(find_verses("and the").len(), 10);
+        assert!(find_verses("   ").is_empty());
+        assert_eq!(
+            find_verses("js-h 1:2")[0].label,
+            "Joseph Smith--History 1:2"
+        );
+
+        let section = chapter("Doctrine and Covenants", 4).unwrap();
+        assert_eq!(section.verses.len(), 7);
+        assert!(section.verses[0].text.contains("a marvelous work"));
+    }
+
+    #[test]
+    fn a_book_filter_matches_names_and_abbreviations() {
+        assert_eq!(volumes_matching("").len(), 5);
+        let genesis = volumes_matching("gen");
+        assert_eq!(genesis.len(), 1);
+        assert_eq!(genesis[0].books.len(), 1);
+        assert_eq!(genesis[0].books[0].title, "Genesis");
+        assert!(volumes_matching("zzzz").is_empty());
+        let covenants = volumes_matching("dc");
+        assert_eq!(covenants[0].books[0].title, "Doctrine and Covenants");
+        assert!(volumes_matching("nephi")
+            .iter()
+            .flat_map(|volume| &volume.books)
+            .any(|book| book.title == "1 Nephi"));
     }
 }

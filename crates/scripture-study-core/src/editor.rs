@@ -190,43 +190,96 @@ pub fn delete_at_end(doc: &mut Document, index: usize) -> Option<Caret> {
     Some(Caret { block: index, char })
 }
 
-/// Converts a paragraph whose text starts with a Markdown block prefix
-/// (`# `, `- `, `[] `, …) into that kind of block. Returns true if converted.
-pub fn apply_markdown_shortcut(block: &mut Block) -> bool {
-    if block.kind != BlockKind::Paragraph {
-        return false;
+/// If the line the caret is on starts with a Markdown block prefix
+/// (`# `, `- `, `* `, `[] `, …), turns that line into its own block.
+/// Leading tabs become the block's indent. Returns where the caret goes.
+pub fn apply_markdown_shortcut(doc: &mut Document, index: usize, caret: usize) -> Option<Caret> {
+    if doc.blocks.get(index).is_none_or(|b| b.kind != BlockKind::Paragraph) {
+        return None;
     }
-    let shortcuts: [(&str, BlockKind); 11] = [
-        ("# ", BlockKind::Heading(1)),
-        ("## ", BlockKind::Heading(2)),
+    let text = doc.blocks[index].text.clone();
+    let caret = caret.min(text.chars().count());
+    let at = char_to_byte(&text, caret);
+    let line_start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+    let line_end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+    let line = &text[line_start..line_end];
+    let tabs = leading_tabs(line);
+    let spaced = &line[tabs..];
+    let spaces = spaced.len() - spaced.trim_start_matches(' ').len();
+    let content = &spaced[spaces..];
+    let (kind, rest) = shortcut_kind(content)?;
+
+    let marker = content.len() - rest.len();
+    let rest_byte = (at - line_start)
+        .saturating_sub(tabs + spaces + marker)
+        .min(rest.len());
+    let char_in_rest = byte_to_char(rest, rest_byte);
+    let para_indent = doc.blocks[index].indent;
+    let indent = (para_indent + tabs as u8).min(MAX_INDENT);
+    let before = if line_start == 0 {
+        ""
+    } else {
+        &text[..line_start - 1]
+    };
+    let after = if line_end < text.len() {
+        &text[line_end + 1..]
+    } else {
+        ""
+    };
+
+    if before.is_empty() {
+        let block = &mut doc.blocks[index];
+        block.kind = kind;
+        block.text = rest.to_string();
+        block.indent = indent;
+        if !after.is_empty() {
+            doc.blocks
+                .insert(index + 1, Block::paragraph(after).indented(para_indent));
+        }
+        return Some(Caret {
+            block: index,
+            char: char_in_rest,
+        });
+    }
+
+    doc.blocks[index].text = before.to_string();
+    doc.blocks
+        .insert(index + 1, Block::new(kind, rest).indented(indent));
+    if !after.is_empty() {
+        doc.blocks
+            .insert(index + 2, Block::paragraph(after).indented(para_indent));
+    }
+    Some(Caret {
+        block: index + 1,
+        char: char_in_rest,
+    })
+}
+
+/// A Markdown prefix at the start of a line, and the text after it.
+fn shortcut_kind(content: &str) -> Option<(BlockKind, &str)> {
+    const CODE: fn() -> BlockKind = || BlockKind::Code {
+        lang: String::new(),
+    };
+    let shortcuts: [(&str, BlockKind); 12] = [
         ("### ", BlockKind::Heading(3)),
+        ("## ", BlockKind::Heading(2)),
+        ("# ", BlockKind::Heading(1)),
         ("- ", BlockKind::Bullet),
         ("* ", BlockKind::Bullet),
+        ("+ ", BlockKind::Bullet),
         ("1. ", BlockKind::Numbered),
         ("[] ", BlockKind::Todo { checked: false }),
         ("[ ] ", BlockKind::Todo { checked: false }),
         ("[x] ", BlockKind::Todo { checked: true }),
         ("> ", BlockKind::Quote),
-        (
-            "```",
-            BlockKind::Code {
-                lang: String::new(),
-            },
-        ),
+        ("```", CODE()),
     ];
     for (prefix, kind) in shortcuts {
-        if let Some(rest) = block.text.strip_prefix(prefix) {
-            block.text = rest.to_string();
-            block.kind = kind;
-            return true;
+        if let Some(rest) = content.strip_prefix(prefix) {
+            return Some((kind, rest));
         }
     }
-    if block.text == "---" {
-        block.text.clear();
-        block.kind = BlockKind::Divider;
-        return true;
-    }
-    false
+    (content == "---").then_some((BlockKind::Divider, ""))
 }
 
 /// Applies a block-kind command from the slash menu to block `index`.
@@ -731,16 +784,58 @@ mod tests {
 
     #[test]
     fn markdown_shortcuts_convert_paragraphs() {
-        let mut b = Block::paragraph("## Hi");
-        assert!(apply_markdown_shortcut(&mut b));
-        assert_eq!(b, Block::new(BlockKind::Heading(2), "Hi"));
+        let mut d = doc(vec![Block::paragraph("## Hi")]);
+        assert_eq!(
+            apply_markdown_shortcut(&mut d, 0, 3),
+            Some(Caret { block: 0, char: 0 })
+        );
+        assert_eq!(d.blocks[0], Block::new(BlockKind::Heading(2), "Hi"));
 
-        let mut b = Block::paragraph("[] task");
-        assert!(apply_markdown_shortcut(&mut b));
-        assert_eq!(b.kind, BlockKind::Todo { checked: false });
+        let mut d = doc(vec![Block::paragraph("[] task")]);
+        assert!(apply_markdown_shortcut(&mut d, 0, 3).is_some());
+        assert_eq!(d.blocks[0].kind, BlockKind::Todo { checked: false });
+        assert_eq!(d.blocks[0].text, "task");
 
-        let mut b = Block::paragraph("plain");
-        assert!(!apply_markdown_shortcut(&mut b));
+        let mut d = doc(vec![Block::paragraph("* ")]);
+        assert_eq!(
+            apply_markdown_shortcut(&mut d, 0, 2),
+            Some(Caret { block: 0, char: 0 })
+        );
+        assert_eq!(d.blocks[0], Block::new(BlockKind::Bullet, ""));
+
+        let mut d = doc(vec![Block::paragraph("- milk")]);
+        assert_eq!(
+            apply_markdown_shortcut(&mut d, 0, 2),
+            Some(Caret { block: 0, char: 0 })
+        );
+        assert_eq!(d.blocks[0], Block::new(BlockKind::Bullet, "milk"));
+
+        let mut d = doc(vec![Block::paragraph("\t+ child")]);
+        assert!(apply_markdown_shortcut(&mut d, 0, 3).is_some());
+        assert_eq!(d.blocks[0], Block::new(BlockKind::Bullet, "child").indented(1));
+
+        let mut d = doc(vec![Block::paragraph("Keep this\n* item\nand this")]);
+        assert_eq!(
+            apply_markdown_shortcut(&mut d, 0, "Keep this\n* ".chars().count()),
+            Some(Caret { block: 1, char: 0 })
+        );
+        assert_eq!(
+            d.blocks,
+            vec![
+                Block::paragraph("Keep this"),
+                Block::new(BlockKind::Bullet, "item"),
+                Block::paragraph("and this"),
+            ]
+        );
+
+        let mut d = doc(vec![Block::paragraph("*italic* and - not a list")]);
+        assert!(apply_markdown_shortcut(&mut d, 0, 1).is_none());
+
+        let mut d = doc(vec![Block::paragraph("plain")]);
+        assert!(apply_markdown_shortcut(&mut d, 0, 5).is_none());
+
+        let mut d = doc(vec![Block::new(BlockKind::Bullet, "- no")]);
+        assert!(apply_markdown_shortcut(&mut d, 0, 2).is_none());
     }
 
     #[test]

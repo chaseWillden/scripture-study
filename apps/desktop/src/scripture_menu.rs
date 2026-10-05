@@ -1,17 +1,29 @@
 //! The scripture picker opened by the `/scripture` command: a search field and
 //! a fuzzy list of passages. Choosing one cites it.
+//!
+//! Drawn with the context menu's popup: the same corner, hairline, and shadow,
+//! a frameless search row, and results that highlight like menu items.
 
 use eframe::egui::{
-    self, vec2, Color32, CornerRadius, EventFilter, FontId, Frame, Id, Key, Margin, Modifiers,
-    Order, Pos2, Rect, RichText, Sense, Shadow, Stroke, TextEdit, Ui,
+    self, vec2, Align, EventFilter, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Order, Pos2,
+    Rect, RichText, Sense, TextEdit, Ui, UiBuilder,
 };
 use scripture_study_core::scriptures::{self, Hit};
 
+use crate::icons;
+use crate::menu;
 use crate::theme::Palette;
 
-const WIDTH: f32 = 440.0;
-const ROW_HEIGHT: f32 = 46.0;
+const WIDTH: f32 = 360.0;
+const SEARCH_HEIGHT: f32 = 28.0;
+const ROW_HEIGHT: f32 = 44.0;
+const HINT_HEIGHT: f32 = 28.0;
 const MAX_LIST: f32 = 320.0;
+const FONT: f32 = 13.5;
+const PREVIEW: f32 = 12.0;
+const ICON_X: f32 = 16.0;
+const TEXT_LEFT: f32 = 32.0;
+const TEXT_RIGHT: f32 = 10.0;
 
 pub struct ScripturePicker {
     pub block: usize,
@@ -57,47 +69,19 @@ impl ScripturePicker {
         let just_opened = self.focus;
         let mut clicked = None;
 
+        let style = menu::popup_style(ctx, palette);
         let area = egui::Area::new(Id::new(("scripture-menu", note_id)))
             .order(Order::Foreground)
             .fixed_pos(self.anchor)
             .constrain(true)
             .show(ctx, |ui| {
-                Frame::new()
-                    .fill(palette.menu_bg)
-                    .stroke(Stroke::new(1.0, palette.border))
-                    .corner_radius(CornerRadius::same(8))
-                    .shadow(Shadow {
-                        offset: [0, 6],
-                        blur: 20,
-                        spread: 0,
-                        color: Color32::from_black_alpha(40),
-                    })
-                    .inner_margin(Margin::same(8))
+                ui.set_style(style.clone());
+                Frame::popup(&style)
                     .show(ui, |ui| {
                         ui.set_width(WIDTH);
-                        ui.label(
-                            RichText::new("Scripture")
-                                .strong()
-                                .size(13.0)
-                                .color(palette.text),
-                        );
-                        ui.add_space(4.0);
-                        let search = TextEdit::singleline(&mut self.query)
-                            .id(Id::new(("scripture-search", note_id)))
-                            .hint_text("Filter by reference or words")
-                            .desired_width(WIDTH)
-                            .event_filter(EventFilter {
-                                tab: false,
-                                horizontal_arrows: true,
-                                vertical_arrows: true,
-                                escape: true,
-                            })
-                            .show(ui);
-                        if self.focus {
-                            search.response.request_focus();
-                            self.focus = false;
-                        }
-                        if search.response.changed() {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        let changed = self.search_field(ui, note_id, palette);
+                        if changed {
                             self.selected = 0;
                             self.scroll = true;
                             self.hits = scriptures::search(&self.query);
@@ -114,9 +98,10 @@ impl ScripturePicker {
                                 self.scroll = true;
                             }
                         }
-                        ui.add_space(6.0);
+                        menu::separator(ui, palette);
                         clicked = self.list(ui, palette);
-                    });
+                    })
+                    .inner;
             });
 
         if let Some(index) = clicked {
@@ -134,21 +119,58 @@ impl ScripturePicker {
         outcome
     }
 
+    /// The search row: a menu item with a magnifying glass and no field chrome.
+    /// Returns whether the query changed.
+    fn search_field(&mut self, ui: &mut Ui, note_id: &str, palette: &Palette) -> bool {
+        let (rect, _) =
+            ui.allocate_exact_size(vec2(ui.available_width(), SEARCH_HEIGHT), Sense::hover());
+        icons::search(
+            ui.painter(),
+            egui::pos2(rect.left() + ICON_X, rect.center().y),
+            palette.faint,
+        );
+        let field = Rect::from_min_max(
+            egui::pos2(rect.left() + TEXT_LEFT, rect.top()),
+            egui::pos2(rect.right() - TEXT_RIGHT, rect.bottom()),
+        );
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .max_rect(field)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        let search = TextEdit::singleline(&mut self.query)
+            .id(Id::new(("scripture-search", note_id)))
+            .frame(Frame::NONE)
+            .margin(Margin::ZERO)
+            .desired_width(field.width())
+            .font(FontId::proportional(FONT))
+            .text_color(palette.text)
+            .hint_text(
+                RichText::new("Filter by reference or words")
+                    .size(FONT)
+                    .color(palette.faint),
+            )
+            .event_filter(EventFilter {
+                tab: false,
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                escape: true,
+            })
+            .show(&mut child);
+        if self.focus {
+            search.response.request_focus();
+            self.focus = false;
+        }
+        search.response.changed()
+    }
+
     fn list(&mut self, ui: &mut Ui, palette: &Palette) -> Option<usize> {
         if self.query.trim().is_empty() {
-            ui.label(
-                RichText::new("1 Nephi 1:11 or Ether 2:1-4")
-                    .size(13.0)
-                    .color(palette.faint),
-            );
+            hint(ui, palette, "1 Nephi 1:11 or Ether 2:1-4");
             return None;
         }
         if self.hits.is_empty() {
-            ui.label(
-                RichText::new("No matching scriptures")
-                    .size(13.0)
-                    .color(palette.faint),
-            );
+            hint(ui, palette, "No matching scriptures");
             return None;
         }
         let mut clicked = None;
@@ -157,10 +179,20 @@ impl ScripturePicker {
             .iter()
             .map(|hit| (hit.label.clone(), hit.preview.clone()))
             .collect();
+        // The area keeps last frame's size, and a scroll area will shrink to
+        // fit that instead of asking it to grow. Reserve the list's height so
+        // a short empty picker can open up once there are results.
+        let spacing = 1.0;
+        let full = rows.len() as f32 * ROW_HEIGHT + (rows.len() - 1) as f32 * spacing;
+        let height = full.min(MAX_LIST);
+        if ui.available_height() + 1.0 < height {
+            ui.ctx().request_repaint();
+        }
+        ui.set_min_height(height);
         egui::ScrollArea::vertical()
-            .max_height(MAX_LIST)
+            .max_height(height)
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.spacing_mut().item_spacing.y = spacing;
                 for (n, (label, preview)) in rows.iter().enumerate() {
                     let (rect, response) = ui.allocate_exact_size(
                         vec2(ui.available_width(), ROW_HEIGHT),
@@ -172,28 +204,36 @@ impl ScripturePicker {
                     if response.hovered() && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
                         self.selected = n;
                     }
-                    if n == self.selected {
-                        ui.painter().rect_filled(rect, 5.0, palette.menu_selected);
+                    let selected = n == self.selected;
+                    if selected {
+                        ui.painter().rect_filled(rect, 6.0, palette.menu_selected);
                         if std::mem::take(&mut self.scroll) {
                             response.scroll_to_me(None);
                         }
                     }
-                    ui.painter().text(
-                        rect.left_top() + vec2(8.0, 6.0),
-                        egui::Align2::LEFT_TOP,
-                        label,
-                        FontId::proportional(14.0),
-                        palette.text,
+                    let icon_color = if selected {
+                        palette.text
+                    } else {
+                        palette.faint
+                    };
+                    icons::quote(
+                        ui.painter(),
+                        egui::pos2(rect.left() + ICON_X, rect.center().y),
+                        icon_color,
                     );
-                    let preview_rect = Rect::from_min_size(
-                        rect.left_top() + vec2(8.0, 24.0),
-                        vec2(rect.width() - 16.0, 16.0),
-                    );
-                    ui.painter().with_clip_rect(preview_rect).text(
-                        preview_rect.left_center(),
-                        egui::Align2::LEFT_CENTER,
-                        preview,
-                        FontId::proportional(12.0),
+                    let text_width = rect.right() - TEXT_RIGHT - (rect.left() + TEXT_LEFT);
+                    let label_galley =
+                        crate::sidebar::elided(ui, label, FONT, palette.text, text_width);
+                    let preview_galley =
+                        crate::sidebar::elided(ui, preview, PREVIEW, palette.faint, text_width);
+                    let block = label_galley.size().y + 1.0 + preview_galley.size().y;
+                    let top = rect.center().y - block / 2.0;
+                    let x = rect.left() + TEXT_LEFT;
+                    ui.painter()
+                        .galley(egui::pos2(x, top), label_galley, palette.text);
+                    ui.painter().galley(
+                        egui::pos2(x, top + block - preview_galley.size().y),
+                        preview_galley,
                         palette.faint,
                     );
                     if response.clicked() {
@@ -203,6 +243,21 @@ impl ScripturePicker {
             });
         clicked
     }
+}
+
+/// A faint line where results will be, in the same place as a menu label.
+fn hint(ui: &mut Ui, palette: &Palette, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), HINT_HEIGHT), Sense::hover());
+    let width = rect.right() - TEXT_RIGHT - (rect.left() + TEXT_LEFT);
+    let galley = crate::sidebar::elided(ui, text, FONT, palette.faint, width);
+    ui.painter().galley(
+        egui::pos2(
+            rect.left() + TEXT_LEFT,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        palette.faint,
+    );
 }
 
 /// Keeps a space that was typed before `/` when a slash command is removed

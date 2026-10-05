@@ -58,6 +58,12 @@ pub enum SidebarAction {
     MoveNoteOut(String),
     /// Move a folder out of the notes folder to a place picked on disk.
     MoveFolderOut(String),
+    /// Show scriptures in the sidebar, in place of the notes list.
+    OpenScriptures,
+    /// Leave scriptures and show the notes list.
+    ShowNotes,
+    /// Leave scriptures and keep the sidebar view just chosen.
+    CloseScriptures,
 }
 
 pub const MOVE_OUT_LABEL: &str = "Move to location…";
@@ -252,6 +258,13 @@ impl Sidebar {
         }
     }
 
+    /// Opens the notes list. Used when leaving the scriptures page.
+    pub fn show_recent(&mut self) {
+        self.open = true;
+        self.view = View::Recent;
+        self.search = None;
+    }
+
     pub fn show(&mut self, ui: &mut Ui, notes: &Notes, palette: &Palette) -> Option<SidebarAction> {
         let mut action = None;
         ui.spacing_mut().item_spacing = vec2(0.0, 2.0);
@@ -332,7 +345,13 @@ impl Sidebar {
     }
 
     /// The icon rail that stays visible when the sidebar is collapsed.
-    pub fn rail(&mut self, ui: &mut Ui, palette: &Palette) -> Option<SidebarAction> {
+    /// `scriptures` is true while the scriptures page is open.
+    pub fn rail(
+        &mut self,
+        ui: &mut Ui,
+        palette: &Palette,
+        scriptures: bool,
+    ) -> Option<SidebarAction> {
         let mut action = None;
         let mut next = egui::pos2(ui.max_rect().center().x, ui.cursor().top() + 2.0);
         let mut button = |ui: &mut Ui, label, shortcut, active, icon| {
@@ -345,17 +364,45 @@ impl Sidebar {
         };
 
         let showing = |view| self.open && self.view == view && self.search.is_none();
-        let (recent, organizing) = (showing(View::Recent), showing(View::Folders));
+        // Scriptures replaces the notes list, so the notes icon is not the
+        // current one and clicking it switches back instead of collapsing.
+        let recent = showing(View::Recent) && !scriptures;
+        let organizing = showing(View::Folders) && !scriptures;
         let label = if recent { "Hide notes" } else { "Show notes" };
         if button(ui, label, Some(TOGGLE_SIDEBAR), recent, icons::notes) {
-            self.switch_to(View::Recent);
+            if scriptures {
+                action = Some(SidebarAction::ShowNotes);
+            } else {
+                self.switch_to(View::Recent);
+            }
         }
         if button(ui, "Organize notes", None, organizing, icons::folder) {
-            self.switch_to(View::Folders);
+            if scriptures {
+                self.open = true;
+                self.view = View::Folders;
+                self.search = None;
+                action = Some(SidebarAction::CloseScriptures);
+            } else {
+                self.switch_to(View::Folders);
+            }
         }
-        let searching = self.open && self.search.is_some();
+        // The book icon stays selected for the whole scriptures page. Clicking
+        // it again collapses the panel, the same way the notes icon does.
+        if button(ui, "Scriptures", None, scriptures, icons::book) {
+            if scriptures && self.open {
+                self.open = false;
+            } else {
+                self.open = true;
+                self.search = None;
+                action = Some(SidebarAction::OpenScriptures);
+            }
+        }
+        let searching = self.open && self.search.is_some() && !scriptures;
         if button(ui, "Search notes", Some(SEARCH), searching, icons::search) {
             self.start_search();
+            if scriptures {
+                action = Some(SidebarAction::CloseScriptures);
+            }
         }
         if button(ui, "New note", Some(NEW_NOTE), false, icons::compose) {
             action = Some(SidebarAction::New);
@@ -1110,11 +1157,37 @@ fn icon_button(
         palette.faint
     };
     paint(ui.painter(), rect.center(), color);
-    let hover = match shortcut {
-        Some(shortcut) => format!("{label} ({})", ui.ctx().format_shortcut(&shortcut)),
-        None => label.to_string(),
-    };
-    response.on_hover_text(hover)
+    let shortcut = shortcut.map(|shortcut| ui.ctx().format_shortcut(&shortcut));
+    rail_tooltip(&response, label, shortcut.as_deref(), palette);
+    response
+}
+
+/// A small popover to the side of a rail button, with its name and shortcut.
+fn rail_tooltip(response: &Response, label: &str, shortcut: Option<&str>, palette: &Palette) {
+    let palette = *palette;
+    let mut tip = egui::Tooltip::for_enabled(response).gap(10.0).width(220.0);
+    tip.popup = tip
+        .popup
+        .align(egui::RectAlign::RIGHT)
+        .align_alternatives(&[egui::RectAlign::LEFT])
+        .style(move |style: &mut egui::Style| {
+            menu::apply_style(style, &palette);
+            style.spacing.menu_margin = Margin::symmetric(12, 8);
+            style.spacing.item_spacing = vec2(10.0, 0.0);
+        });
+    tip.show(|ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(label).size(13.5).color(palette.text));
+            if let Some(shortcut) = shortcut {
+                ui.label(
+                    egui::RichText::new(shortcut)
+                        .size(12.0)
+                        .color(palette.faint),
+                );
+            }
+        });
+    });
 }
 
 /// One line of text, cut off with "…" if it's wider than `width`.
