@@ -1,0 +1,28 @@
+[package]
+name = "scripture-study-desktop"
+description = "Scripture Study desktop app."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scripture-study"
+path = "src/main.rs"
+
+[dependencies]
+scripture-study-core.workspace = true
+eframe = "0.36"
+dirs = "6"
+libc = "0.2.189"
+# Reading screenshots from the clipboard, and decoding/encoding pictures.
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.17"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
+tempfile = "3"
+
+# The macOS menu bar.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.17"

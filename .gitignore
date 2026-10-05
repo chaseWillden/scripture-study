@@ -1,0 +1,14 @@
+# Build output
+/target
+
+# macOS
+.DS_Store
+
+# Editor leftovers
+*.swp
+*.rs.bk
+.idea/
+
+# Source download for the bundled scripture JSON. The app compiles
+# crates/scripture-study-core/data/lds-scriptures.json, not this archive.
+/lds-scriptures-*.zip
