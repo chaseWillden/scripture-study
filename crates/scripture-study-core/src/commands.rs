@@ -14,6 +14,8 @@ pub enum Action {
     InsertCitation,
     /// Open the scripture picker; the chosen passage is cited by its reference.
     InsertScripture,
+    /// Open the document picker; the chosen note is inserted as a link.
+    InsertFileLink,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +106,12 @@ pub fn builtin() -> Vec<Command> {
             "",
             &["verse", "bible", "book of mormon", "lds"],
             Action::InsertScripture,
+        ),
+        Command::new(
+            "File link",
+            "",
+            &["file-link", "document", "link"],
+            Action::InsertFileLink,
         ),
         Command::new("New note", "", &["create", "page"], Action::NewNote),
         Command::new("Delete note", "", &["remove", "trash"], Action::DeleteNote),
@@ -202,6 +210,7 @@ mod tests {
     fn keywords_and_subsequences_match() {
         assert_eq!(labels("h2")[0], "Heading 2");
         assert_eq!(labels("todo")[0], "To-do");
+        assert_eq!(labels("file-link")[0], "File link");
         assert!(labels("hdg").contains(&"Heading 1".to_string()));
     }
 

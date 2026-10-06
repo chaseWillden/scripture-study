@@ -189,13 +189,47 @@ impl Document {
             .collect()
     }
 
-    /// 1-based position of the numbered-list item at `index` within its run.
+    /// Blocks nested under `index`, when it has any.
+    ///
+    /// A following block is nested while its outline depth is greater.
+    /// Empty paragraphs are gaps: they neither end the group nor count as a
+    /// sub item by themselves. A paragraph's depth is the leading tabs on
+    /// its first line; every other block uses its indent.
+    pub fn outline_child_range(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        let parent = self.blocks.get(index).and_then(outline_depth)?;
+        let mut end = index + 1;
+        let mut nested = false;
+        while end < self.blocks.len() {
+            match outline_depth(&self.blocks[end]) {
+                None => end += 1,
+                Some(depth) if depth > parent => {
+                    nested = true;
+                    end += 1;
+                }
+                Some(_) => break,
+            }
+        }
+        nested.then_some(index + 1..end)
+    }
+
+    /// 1-based position of the numbered item at `index` within its run.
+    ///
+    /// A run is the numbered items at one indent. Nested items are their own
+    /// run, starting at 1, and do not count toward the parent. A shallower
+    /// block, or anything else at this indent, ends the run.
     pub fn list_number(&self, index: usize) -> usize {
-        self.blocks[..=index]
-            .iter()
-            .rev()
-            .take_while(|b| b.kind == BlockKind::Numbered)
-            .count()
+        let indent = self.blocks[index].indent;
+        let mut count = 0;
+        for block in self.blocks[..=index].iter().rev() {
+            if block.kind == BlockKind::Numbered && block.indent == indent {
+                count += 1;
+            } else if block.indent > indent {
+                continue;
+            } else {
+                break;
+            }
+        }
+        count
     }
 
     pub fn to_markdown(&self) -> String {
@@ -224,7 +258,9 @@ impl Document {
     fn body_markdown(&self) -> String {
         let mut out = String::new();
         let mut prev: Option<&BlockKind> = None;
-        let mut number = 0;
+        // Next number at each indent. A shallower item drops the deeper runs
+        // so a nested list starts at 1 again.
+        let mut numbers: Vec<usize> = Vec::new();
 
         for block in &self.blocks {
             // Empty paragraphs are editing scaffolding; Markdown can't hold them.
@@ -238,11 +274,7 @@ impl Document {
                 out.push_str(if same_list { "\n" } else { "\n\n" });
             }
             let start = out.len();
-            number = if block.kind == BlockKind::Numbered && prev == Some(&BlockKind::Numbered) {
-                number + 1
-            } else {
-                1
-            };
+            let number = list_marker_number(&mut numbers, block);
 
             match &block.kind {
                 BlockKind::Paragraph => out.push_str(&block.text),
@@ -419,6 +451,43 @@ impl Document {
     }
 }
 
+/// Identity of a block for outline settings: its kind and first line.
+///
+/// Stored in `.scripture-study` so a folded item can be found again after
+/// the note is reopened. The first line includes its leading tabs.
+pub fn outline_key(block: &Block) -> String {
+    let line = block.text.split('\n').next().unwrap_or("");
+    let kind = match &block.kind {
+        BlockKind::Paragraph => "p",
+        BlockKind::Heading(level) => return format!("h{level}:{line}"),
+        BlockKind::Bullet => "b",
+        BlockKind::Numbered => "n",
+        BlockKind::Todo { .. } => "t",
+        BlockKind::Quote => "q",
+        BlockKind::Code { .. } => "c",
+        BlockKind::Divider => "d",
+        BlockKind::Image { src, .. } => return format!("i:{src}"),
+    };
+    format!("{kind}:{line}")
+}
+
+/// Outline depth of a block that participates in nesting, or `None` when
+/// the block is only a gap (an empty paragraph).
+fn outline_depth(block: &Block) -> Option<usize> {
+    match block.kind {
+        BlockKind::Paragraph => {
+            if block.text.trim().is_empty() {
+                None
+            } else {
+                Some(paragraph_depth(&block.text))
+            }
+        }
+        // A divider breaks an outline the way a heading at the left margin does.
+        BlockKind::Divider => Some(0),
+        _ => Some(block.indent as usize),
+    }
+}
+
 /// How many leading tabs the paragraph's first line has.
 fn paragraph_depth(text: &str) -> usize {
     text.split('\n')
@@ -442,6 +511,26 @@ fn indent_of(line: &str, list_item: bool) -> u8 {
     }
     let per_level = if list_item { 2 } else { 4 };
     (tabs + spaces / per_level).min(MAX_INDENT as usize) as u8
+}
+
+/// The marker number for a numbered item, updating `numbers` for every block
+/// so a later item at the same indent keeps counting.
+fn list_marker_number(numbers: &mut Vec<usize>, block: &Block) -> usize {
+    let depth = block.indent as usize;
+    if block.kind != BlockKind::Numbered {
+        if block.kind.continues_on_enter() {
+            numbers.truncate(depth);
+        } else {
+            numbers.clear();
+        }
+        return 1;
+    }
+    numbers.truncate(depth + 1);
+    if numbers.len() < depth + 1 {
+        numbers.resize(depth + 1, 0);
+    }
+    numbers[depth] += 1;
+    numbers[depth]
 }
 
 fn push_prefixed(out: &mut String, first: &str, rest: &str, text: &str) {
@@ -668,6 +757,42 @@ fn main() {
     }
 
     #[test]
+    fn nested_numbered_lists_restart_at_each_indent() {
+        let doc = Document::new(vec![
+            Block::new(BlockKind::Numbered, "Prophecies"),
+            Block::new(BlockKind::Numbered, "Jeremiah").indented(1),
+            Block::new(BlockKind::Numbered, "Isaiah").indented(1),
+            Block::new(BlockKind::Bullet, "aside").indented(2),
+            Block::new(BlockKind::Numbered, "Zedekiah").indented(1),
+            Block::new(BlockKind::Numbered, "Fulfillment"),
+        ]);
+        assert_eq!(
+            doc.blocks
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| doc.blocks[*i].kind == BlockKind::Numbered)
+                .map(|(i, _)| doc.list_number(i))
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2, 3, 2]
+        );
+        let md = doc.to_markdown();
+        assert_eq!(
+            md,
+            "\
+1. Prophecies
+	1. Jeremiah
+	2. Isaiah
+
+		- aside
+
+	3. Zedekiah
+2. Fulfillment
+"
+        );
+        assert_eq!(roundtrip(&doc), doc);
+    }
+
+    #[test]
     fn images_roundtrip_on_their_own_line() {
         let md = "Before\n\n![A cat](.assets/cat.png)\n\nSee ![inline](x.png) here\n";
         let doc = Document::from_markdown(md);
@@ -696,6 +821,40 @@ fn main() {
             doc.paragraph_numbers(),
             [None, Some(1), None, None, Some(2)]
         );
+    }
+
+    #[test]
+    fn outline_child_range_covers_deeper_blocks_until_a_sibling() {
+        let doc = Document::new(vec![
+            Block::paragraph("Parent"),
+            Block::paragraph("\tChild"),
+            Block::paragraph("\t\tGrandchild"),
+            Block::paragraph(""),
+            Block::paragraph("\tOther child"),
+            Block::paragraph("Sibling"),
+            Block::new(BlockKind::Heading(1), "Next"),
+        ]);
+        assert_eq!(doc.outline_child_range(0), Some(1..5));
+        // The blank line before the next item at this depth is part of the fold.
+        assert_eq!(doc.outline_child_range(1), Some(2..4));
+        assert_eq!(doc.outline_child_range(2), None);
+        assert_eq!(doc.outline_child_range(4), None);
+        assert_eq!(doc.outline_child_range(5), None);
+        // Nothing is indented under the heading.
+        assert_eq!(doc.outline_child_range(6), None);
+    }
+
+    #[test]
+    fn outline_child_range_includes_an_indented_block_and_stops_at_a_peer() {
+        let doc = Document::new(vec![
+            Block::paragraph("Parent"),
+            Block::new(BlockKind::Bullet, "nested").indented(1),
+            Block::new(BlockKind::Bullet, "peer"),
+            Block::paragraph("\tAfter the list"),
+        ]);
+        assert_eq!(doc.outline_child_range(0), Some(1..2));
+        // The indented paragraph nests under the peer bullet, not the parent.
+        assert_eq!(doc.outline_child_range(2), Some(3..4));
     }
 
     #[test]

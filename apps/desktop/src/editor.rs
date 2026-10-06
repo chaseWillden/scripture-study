@@ -3,7 +3,8 @@
 //! Editing semantics live in `scripture_study_core::editor`; this module maps keys and
 //! clicks onto those operations and draws the result.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -16,18 +17,24 @@ use eframe::egui::{
 use scripture_study_core::{
     citations,
     commands::{self, Action, Command},
+    document::outline_key,
     editor::{self as ops, Caret, SlashQuery},
     history::History,
-    inline, links,
+    inline::{self, MarkKind, DEFAULT_HIGHLIGHT, DEFAULT_UNDERLINE},
+    links, marks,
     selection::{self, Selection},
-    Block, BlockKind, Document,
+    settings::CollapsedOutline,
+    Block, BlockKind, Document, NoteMeta,
 };
 
 use crate::citation_form::{self, CitationForm, Outcome};
+use crate::file_menu::FilePicker;
 use crate::find_bar::{self, FindBar};
 use crate::link_menu::{self, LinkForm, LinkMenu, LinkTarget};
+use crate::marks::{BarAction, MarkMenu};
 use crate::meta::{self, MetaEditor};
 use crate::scripture_menu::ScripturePicker;
+use crate::spell::{self, SpellChoice, SpellMenu, Spelling};
 use crate::theme::{self, Palette};
 
 const MENU_WIDTH: f32 = 280.0;
@@ -46,6 +53,8 @@ pub enum Event {
     Changed,
     /// A slash command that acts on notes rather than on blocks.
     Run(Action),
+    /// Open the note with this id.
+    OpenNote(String),
 }
 
 enum Op {
@@ -71,6 +80,24 @@ enum Op {
         end: usize,
         marker: &'static str,
     },
+    /// Highlight or underline. `selection` uses the document selection;
+    /// otherwise `start..end` in `block`.
+    Mark {
+        selection: bool,
+        block: usize,
+        start: usize,
+        end: usize,
+        kind: MarkKind,
+        color: Option<u32>,
+        toggle: bool,
+    },
+    /// Take both highlight and underline off a selection.
+    ClearMarks {
+        selection: bool,
+        block: usize,
+        start: usize,
+        end: usize,
+    },
     Kind {
         block: usize,
         kind: BlockKind,
@@ -81,6 +108,14 @@ enum Op {
     Select(Selection),
     DeleteSelection,
     ReplaceSelection(String),
+    /// Insert `text` in place of characters `start..end` of one block. A
+    /// multi-line paste comes through here so a list stays a list.
+    InsertAt {
+        block: usize,
+        start: usize,
+        end: usize,
+        text: String,
+    },
     SplitSelection,
     /// Turn a pasted URL into a link, around the selected text if any.
     InsertLink {
@@ -124,6 +159,13 @@ enum Op {
         label: String,
         text: String,
     },
+    /// Insert a link to another note. `title` is the visible text.
+    InsertNoteLink {
+        block: usize,
+        at: usize,
+        id: String,
+        title: String,
+    },
     /// Replace a block's text and select `char..end` (a caret if equal).
     SetText {
         block: usize,
@@ -144,6 +186,8 @@ struct OpenMenu<'a> {
 #[derive(Clone, Debug, PartialEq)]
 enum Target {
     Url(String),
+    /// Another note in the library.
+    Note(String),
     /// A citation's number: jump to it in the list below.
     Citation(String),
 }
@@ -194,6 +238,18 @@ pub struct Editor {
     citation_form: Option<CitationForm>,
     /// The menu for a right-clicked link, while it's open.
     link_menu: Option<LinkMenu>,
+    /// The menu for a right-clicked misspelling, while it's open.
+    spell_menu: Option<SpellMenu>,
+    /// Highlight and underline colors for the right-clicked text.
+    mark_menu: Option<MarkMenu>,
+    /// Style and color the selection bar applies next. Remembered so the next
+    /// selection opens on the mark you used last.
+    bar_kind: MarkKind,
+    bar_color: u32,
+    /// The word the caret is still typing. `committed` means space, tab, or
+    /// newline has finished it. Tab does not leave the word, so the line has
+    /// to remember the key.
+    spell_open: Option<SpellOpen>,
     /// The "Edit link" form, while it's open.
     link_form: Option<LinkForm>,
     /// Where the caret goes once the form has closed. egui keeps the form's
@@ -212,6 +268,8 @@ pub struct Editor {
     ref_rects: HashMap<String, Rect>,
     /// The scripture picker opened by `/scripture`.
     scripture_picker: Option<ScripturePicker>,
+    /// The document picker opened by `/file-link`.
+    file_picker: Option<FilePicker>,
     /// Where the slash menu was drawn, so the scripture picker opens there.
     menu_anchor: Pos2,
     /// Undo and redo for the whole note.
@@ -219,6 +277,23 @@ pub struct Editor {
     /// This frame's change came from a command (formatting, a paste, …) and
     /// must be its own undo step rather than join the typing around it.
     separate_change: bool,
+    /// Outline items (by block index) whose sub items are hidden.
+    /// Indices are remapped when the note's blocks move.
+    collapsed: HashSet<usize>,
+    /// Blocks hidden this frame because an ancestor outline item is collapsed.
+    hidden: Vec<bool>,
+    /// Collapsed items last written to the folder's `.scripture-study` file.
+    persisted_outline: Vec<CollapsedOutline>,
+    /// A fold or unfold should be written on the next frame, without waiting
+    /// for the note itself to be saved.
+    outline_dirty: bool,
+}
+
+/// A word the caret is still in, and whether a closing key has finished it.
+struct SpellOpen {
+    block: usize,
+    word: String,
+    committed: bool,
 }
 
 impl Editor {
@@ -232,6 +307,11 @@ impl Editor {
             history: History::new(&doc),
             citation_form: None,
             link_menu: None,
+            spell_menu: None,
+            mark_menu: None,
+            bar_kind: MarkKind::Highlight,
+            bar_color: DEFAULT_HIGHLIGHT,
+            spell_open: None,
             link_form: None,
             caret_after_form: None,
             fetch_page: citation_form::fetch_with_curl,
@@ -240,6 +320,7 @@ impl Editor {
             highlighted_citation: None,
             ref_rects: HashMap::new(),
             scripture_picker: None,
+            file_picker: None,
             menu_anchor: Pos2::ZERO,
             separate_change: false,
             doc,
@@ -260,7 +341,66 @@ impl Editor {
             last_focus: None,
             link_press: None,
             last_caret: None,
+            collapsed: HashSet::new(),
+            hidden: Vec::new(),
+            persisted_outline: Vec::new(),
+            outline_dirty: false,
         }
+    }
+
+    /// Folds the outline items recorded for this note.
+    pub fn restore_collapsed(&mut self, saved: &[CollapsedOutline]) {
+        let wanted: HashSet<(String, usize)> = saved
+            .iter()
+            .map(|item| (item.key.clone(), item.nth))
+            .collect();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        self.collapsed.clear();
+        for (i, block) in self.doc.blocks.iter().enumerate() {
+            let key = outline_key(block);
+            let nth = *seen.entry(key.clone()).or_insert(0);
+            if wanted.contains(&(key, nth)) && self.doc.outline_child_range(i).is_some() {
+                self.collapsed.insert(i);
+            }
+            *seen.get_mut(&outline_key(block)).unwrap() += 1;
+        }
+        self.recompute_hidden();
+        self.persisted_outline = saved.to_vec();
+        // Drop entries that no longer match a parent item.
+        self.outline_dirty = self.collapsed_outline() != saved;
+    }
+
+    /// Folded items, in document order, when they differ from what's saved.
+    pub fn outline_changes(&self) -> Option<Vec<CollapsedOutline>> {
+        let current = self.collapsed_outline();
+        (current != self.persisted_outline).then_some(current)
+    }
+
+    /// True when a fold changed and should be written before the autosave delay.
+    pub fn outline_needs_flush(&self) -> bool {
+        self.outline_dirty && self.outline_changes().is_some()
+    }
+
+    pub fn mark_outline_persisted(&mut self) {
+        self.persisted_outline = self.collapsed_outline();
+        self.outline_dirty = false;
+    }
+
+    fn collapsed_outline(&self) -> Vec<CollapsedOutline> {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut items = Vec::new();
+        for (i, block) in self.doc.blocks.iter().enumerate() {
+            let key = outline_key(block);
+            let nth = *seen.entry(key.clone()).or_insert(0);
+            if self.collapsed.contains(&i) && self.doc.outline_child_range(i).is_some() {
+                items.push(CollapsedOutline {
+                    key: key.clone(),
+                    nth,
+                });
+            }
+            *seen.get_mut(&key).unwrap() += 1;
+        }
+        items
     }
 
     /// Leaves the keyboard focus where it is instead of placing the caret
@@ -285,6 +425,7 @@ impl Editor {
     /// Adds an image after the block being edited (replacing it if it's an
     /// empty paragraph), with an empty paragraph below to keep typing in.
     pub fn insert_image(&mut self, src: String) {
+        let outline_before = self.outline_keys();
         let doc = &mut self.doc;
         let last = doc.blocks.len() - 1;
         let at = self
@@ -329,6 +470,7 @@ impl Editor {
         self.layouts.clear();
         self.pending_selection_end = None;
         let char = ops::leading_tabs(&doc.blocks[index + 1].text);
+        self.rebind_outline(&outline_before);
         self.pending_caret = Some(Caret {
             block: index + 1,
             char,
@@ -371,13 +513,68 @@ impl Editor {
         Id::new(("block", &self.note_id, index))
     }
 
+    /// Misspelled words that are ready for a red line. The word under the
+    /// caret stays bare until space, tab, or newline finishes it.
+    fn spell_ranges(
+        &mut self,
+        spelling: &mut Spelling,
+        block: usize,
+        caret_byte: Option<usize>,
+        boundary: bool,
+    ) -> Vec<Range<usize>> {
+        let typing = caret_byte.and_then(|caret| {
+            let text = &self.doc.blocks[block].text;
+            spell::open_word(text, caret).map(|range| text[range].to_string())
+        });
+        if let Some(word) = typing {
+            match &mut self.spell_open {
+                Some(open) if open.block == block && open.word == word => {
+                    if boundary {
+                        open.committed = true;
+                    }
+                }
+                _ => {
+                    self.spell_open = Some(SpellOpen {
+                        block,
+                        word,
+                        committed: boundary,
+                    });
+                }
+            }
+        }
+        let committed = self
+            .spell_open
+            .as_ref()
+            .filter(|open| open.committed && open.block == block)
+            .map(|open| open.word.clone());
+        let text = &self.doc.blocks[block].text;
+        spelling
+            .misspellings(text)
+            .into_iter()
+            .filter(|range| {
+                let word_committed = committed.as_deref() == Some(&text[range.clone()]);
+                spell::ready_to_mark(text, range, caret_byte, word_committed)
+            })
+            .collect()
+    }
+
     pub fn show(
         &mut self,
         ui: &mut Ui,
         commands: &[Command],
+        notes: &[NoteMeta],
         times: meta::NoteTimes,
         dir: &Path,
+        spelling: &mut Spelling,
     ) -> Vec<Event> {
+        spelling.set_repaint(ui.ctx());
+        // Read before later code consumes the keys. Space lands in the text
+        // during the field; Tab and Enter are applied after this frame draws.
+        let spell_boundary = ui.input(|input| {
+            input.key_pressed(Key::Space)
+                || input.key_pressed(Key::Tab)
+                || input.key_pressed(Key::Enter)
+        });
         let palette = Palette::for_ui(ui);
         let mut events = Vec::new();
         if self.undo_keys(ui) {
@@ -404,8 +601,8 @@ impl Editor {
             self.link_press = None;
             self.highlighted_citation = None;
         }
-        // The scripture search owns the keyboard while it's open.
-        if self.scripture_picker.is_some() {
+        // A picker search owns the keyboard while it's open.
+        if self.scripture_picker.is_some() || self.file_picker.is_some() {
             self.pending_caret = None;
             self.pending_selection_end = None;
             for i in 0..self.doc.blocks.len() {
@@ -446,12 +643,46 @@ impl Editor {
         }
         let selection_color = ui.visuals().selection.bg_fill;
         let mut menu: Option<OpenMenu> = None;
+        // Where the selection bar anchors: the first line of selected text.
+        let mut bar_target: Option<(Rect, bool, usize, usize, usize)> = None;
         let numbers = self.doc.paragraph_numbers();
+        // A caret or a find jump inside a folded item opens it, so the
+        // place we're going is on screen. Folding itself never leaves the
+        // caret in a hidden block.
+        if self.find.reveal {
+            if let Some(m) = self.find.current_match() {
+                self.reveal_outline(m.block);
+            }
+        }
+        if let Some(id) = self.jump_to_citation.clone() {
+            if let Some(block) = self
+                .doc
+                .blocks
+                .iter()
+                .position(|b| citations::refs(&b.text).iter().any(|r| r.id == id))
+            {
+                self.reveal_outline(block);
+            }
+        }
+        self.recompute_hidden();
+        if let Some(caret) = pending {
+            if self.hidden.get(caret.block).copied().unwrap_or(false) {
+                self.reveal_outline(caret.block);
+                self.recompute_hidden();
+            }
+        }
         // Applied after the loop so splitting a line into blocks doesn't
         // shift the ones still being drawn.
         let mut markdown_shortcut = None;
 
         for i in 0..self.doc.blocks.len() {
+            if self.hidden.get(i).copied().unwrap_or(false) {
+                let id = self.block_id(i);
+                if ui.memory(|m| m.has_focus(id)) {
+                    ui.memory_mut(|m| m.surrender_focus(id));
+                }
+                continue;
+            }
             let id = self.block_id(i);
             let kind = self.doc.blocks[i].kind.clone();
             ui.add_space(match kind {
@@ -587,6 +818,30 @@ impl Editor {
                 }
             });
             let output = row.inner;
+            let ranges = if matches!(kind, BlockKind::Code { .. }) {
+                Vec::new()
+            } else {
+                let caret_byte = if focused {
+                    let text = &self.doc.blocks[i].text;
+                    TextEdit::load_state(ui.ctx(), id)
+                        .and_then(|state| state.cursor.char_range())
+                        .or(output.cursor_range)
+                        .map(|range| ops::char_to_byte(text, range.primary.index.0))
+                } else {
+                    None
+                };
+                self.spell_ranges(spelling, i, caret_byte, spell_boundary)
+            };
+            if !ranges.is_empty() {
+                spell::paint_squiggles(
+                    ui.painter(),
+                    &output.galley,
+                    output.galley_pos,
+                    &self.doc.blocks[i].text,
+                    &ranges,
+                    theme::text_height(ui, &kind),
+                );
+            }
             self.layouts
                 .insert(i, (row.response.rect, output.galley_pos));
             let mut shapes = Vec::new();
@@ -629,6 +884,22 @@ impl Editor {
             if !shapes.is_empty() {
                 ui.painter().set(highlight, Shape::Vec(shapes));
             }
+            if bar_target.is_none() && kind.has_text() && !matches!(kind, BlockKind::Code { .. }) {
+                let field = selection.filter(|(start, end)| start != end);
+                let across = self
+                    .selection
+                    .filter(|sel| !sel.is_empty())
+                    .and_then(|sel| sel.in_block(&self.doc, i))
+                    .filter(|(from, to, _)| from != to);
+                let range = field
+                    .map(|(start, end)| (false, start, end))
+                    .or_else(|| across.map(|(from, to, _)| (true, from, to)));
+                if let Some((across, start, end)) = range {
+                    if let Some(rect) = span_rect(&output.galley, output.galley_pos, start, end) {
+                        bar_target = Some((rect, across, i, start, end));
+                    }
+                }
+            }
 
             if focused {
                 self.skip_link_markup(ui, i, id);
@@ -645,25 +916,55 @@ impl Editor {
                 }
             }
 
-            // Right-clicking a link opens its menu.
+            // Right-clicking a misspelled word opens its menu. A link that
+            // isn't misspelled keeps the link menu.
             if output.response.secondary_clicked() {
-                let text = &self.doc.blocks[i].text;
-                let at = ui
+                let hit = ui
                     .input(|input| input.pointer.interact_pos())
                     .and_then(|p| {
-                        let at = char_under(&output.galley, p - output.galley_pos, text)?;
-                        Some((p, at))
+                        let text = &self.doc.blocks[i].text;
+                        let byte = char_under(&output.galley, p - output.galley_pos, text)?;
+                        let word = ranges.iter().find(|range| range.contains(&byte)).cloned();
+                        let word = word.map(|range| {
+                            let word = text[range.clone()].to_string();
+                            (range, word)
+                        });
+                        let link = LinkTarget::at(i, text, byte);
+                        Some((p, byte, word, link))
                     });
-                if let Some((pos, target)) =
-                    at.and_then(|(p, at)| Some((p, LinkTarget::at(i, text, at)?)))
-                {
-                    self.link_menu = Some(LinkMenu::new(target, pos));
+                if let Some((pos, byte, word, link)) = hit {
+                    let doc_sel = self.selection.filter(|s| !s.is_empty());
+                    let field = selection.filter(|(start, end)| start != end);
+                    // A selection is what gets annotated. Otherwise a misspelling
+                    // or a link keeps its own menu, which also offers marks.
+                    if doc_sel.is_some() || field.is_some() {
+                        let (start, end) = field.unwrap_or((0, 0));
+                        self.mark_menu = Some(MarkMenu::new(doc_sel.is_some(), i, start, end, pos));
+                        self.spell_menu = None;
+                        self.link_menu = None;
+                    } else if let Some((range, word)) = word {
+                        let suggestions = spelling.suggestions(&word);
+                        self.spell_menu =
+                            Some(SpellMenu::new(i, range, word, suggestions, pos, link));
+                        self.link_menu = None;
+                        self.mark_menu = None;
+                    } else if let Some(target) = link {
+                        self.link_menu = Some(LinkMenu::new(target, pos));
+                        self.spell_menu = None;
+                        self.mark_menu = None;
+                    } else {
+                        let char = ops::byte_to_char(&self.doc.blocks[i].text, byte);
+                        self.mark_menu = Some(MarkMenu::new(false, i, char, char, pos));
+                        self.spell_menu = None;
+                        self.link_menu = None;
+                    }
                 }
             }
 
-            if let Some(press) = self.link_click(ui, i, &output, focused) {
+            if let Some(press) = self.link_click(ui, i, &output, focused, notes) {
                 match press.target {
                     Target::Url(url) => ui.ctx().open_url(egui::OpenUrl::new_tab(url)),
+                    Target::Note(id) => events.push(Event::OpenNote(id)),
                     Target::Citation(id) => self.jump_to_citation = Some(id),
                 }
                 if !press.editing {
@@ -694,15 +995,13 @@ impl Editor {
                     0.0
                 };
                 let first_line = output.galley.pos_from_cursor(CCursor::new(0));
-                ui.painter().text(
-                    egui::pos2(
-                        output.galley_pos.x + line_indent - indent - PARAGRAPH_NUMBER_GAP,
-                        output.galley_pos.y + first_line.center().y,
-                    ),
-                    egui::Align2::RIGHT_CENTER,
-                    n.to_string(),
-                    FontId::proportional(12.0),
-                    palette.subtle,
+                self.paragraph_number(
+                    ui,
+                    i,
+                    n,
+                    output.galley_pos.x + line_indent - indent - PARAGRAPH_NUMBER_GAP,
+                    output.galley_pos.y + first_line.center().y,
+                    &palette,
                 );
             }
 
@@ -747,42 +1046,221 @@ impl Editor {
         }
         // Edits made from a menu or form place the caret once it has closed.
         let mut from_form = false;
+        let link_colors = self.link_menu.as_ref().and_then(|menu| {
+            let text = &self.doc.blocks.get(menu.target.block)?.text;
+            if !menu.target.still_in(text) {
+                return None;
+            }
+            let start = ops::byte_to_char(text, menu.target.label.start);
+            let end = ops::byte_to_char(text, menu.target.label.end);
+            Some(mark_colors(text, start, end))
+        });
         if let Some(link_menu) = &mut self.link_menu {
-            let (choice, open) = link_menu.show(ui.ctx(), &palette);
+            let (highlight, underline) = link_colors.unwrap_or((None, None));
+            let (choice, open) = link_menu.show(ui.ctx(), &palette, highlight, underline);
             let target = link_menu.target.clone();
             if !open {
                 self.link_menu = None;
             }
-            let text = self
+            if let Some(choice) = choice {
+                if let Some(next) = self.apply_link_choice(choice, target, ui) {
+                    op = Some(next);
+                }
+            }
+        }
+        let spell_still = self
+            .spell_menu
+            .as_ref()
+            .map(|menu| (menu.block, menu.range.clone(), menu.word.clone()));
+        if let Some((block, range, word)) = spell_still {
+            let valid = self
                 .doc
                 .blocks
-                .get(target.block)
-                .map(|b| b.text.clone())
-                .filter(|text| target.still_in(text));
-            match (choice, text) {
-                (Some(link_menu::Choice::Copy), _) => ui.ctx().copy_text(target.url.clone()),
-                (Some(link_menu::Choice::Edit), Some(text)) => {
-                    self.link_form = Some(LinkForm::new(target, &text));
+                .get(block)
+                .and_then(|block| block.text.get(range))
+                == Some(word.as_str());
+            if !valid {
+                self.spell_menu = None;
+            }
+        }
+        let spell_colors = self.spell_menu.as_ref().and_then(|menu| {
+            let text = self.doc.blocks.get(menu.block)?.text.as_str();
+            let start = ops::byte_to_char(text, menu.range.start.min(text.len()));
+            let end = ops::byte_to_char(text, menu.range.end.min(text.len()));
+            Some(mark_colors(text, start, end))
+        });
+        let spell_choice = self.spell_menu.as_mut().map(|menu| {
+            let (highlight, underline) = spell_colors.unwrap_or((None, None));
+            let (choice, open) = menu.show(ui.ctx(), &palette, highlight, underline);
+            (
+                choice,
+                open,
+                menu.block,
+                menu.range.clone(),
+                menu.word.clone(),
+                menu.link.clone(),
+            )
+        });
+        if let Some((choice, open, block, range, word, link)) = spell_choice {
+            if !open {
+                self.spell_menu = None;
+            }
+            match choice {
+                Some(SpellChoice::Replace(with)) => {
+                    if let Some(current) = self.doc.blocks.get(block).map(|b| b.text.clone()) {
+                        if current.get(range.clone()) == Some(word.as_str()) {
+                            let char =
+                                ops::byte_to_char(&current, range.start) + with.chars().count();
+                            let mut text = current;
+                            text.replace_range(range, &with);
+                            self.separate_change = true;
+                            op = Some(Op::SetText {
+                                block,
+                                text,
+                                char,
+                                end: char,
+                            });
+                        }
+                    }
                 }
-                (Some(link_menu::Choice::Remove), Some(text)) => {
-                    let label = text[target.label.clone()].to_string();
-                    let (text, char) = target.replace(&text, &label);
-                    op = Some(Op::SetText {
-                        block: target.block,
-                        text,
-                        char,
-                        end: char,
-                    });
+                Some(SpellChoice::IgnoreAll) => spelling.ignore_all(&word),
+                Some(SpellChoice::AddToDictionary) => spelling.add(&word),
+                Some(SpellChoice::Link(choice)) => {
+                    if let Some(target) = link {
+                        if let Some(next) = self.apply_link_choice(choice, target, ui) {
+                            op = Some(next);
+                        }
+                    }
                 }
-                (Some(link_menu::Choice::ConvertToCitation), Some(text)) => {
-                    let title = if target.is_bare() {
-                        String::new()
-                    } else {
-                        inline::plain_text(&text[target.label.clone()])
-                    };
-                    self.citation_form = Some(CitationForm::from_link(target, title));
+                Some(SpellChoice::Mark(choice)) => {
+                    if let Some(current) = self.doc.blocks.get(block).map(|b| b.text.clone()) {
+                        if current.get(range.clone()) == Some(word.as_str()) {
+                            let start = ops::byte_to_char(&current, range.start);
+                            let end = ops::byte_to_char(&current, range.end);
+                            op = Some(Op::Mark {
+                                selection: false,
+                                block,
+                                start,
+                                end,
+                                kind: choice.kind,
+                                color: choice.color,
+                                toggle: choice.toggle,
+                            });
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        let shown_colors = self.mark_menu.as_ref().map(|menu| {
+            if menu.selection {
+                self.selection
+                    .map(|sel| {
+                        (
+                            marks::shared_color(&self.doc, &sel, MarkKind::Highlight),
+                            marks::shared_color(&self.doc, &sel, MarkKind::Underline),
+                        )
+                    })
+                    .unwrap_or((None, None))
+            } else {
+                self.doc
+                    .blocks
+                    .get(menu.block)
+                    .map(|block| mark_colors(&block.text, menu.start, menu.end))
+                    .unwrap_or((None, None))
+            }
+        });
+        let mark_choice =
+            self.mark_menu
+                .as_mut()
+                .zip(shown_colors)
+                .map(|(menu, (highlight, underline))| {
+                    let (choice, open) = menu.show(ui.ctx(), &palette, highlight, underline);
+                    (
+                        choice,
+                        open,
+                        menu.selection,
+                        menu.block,
+                        menu.start,
+                        menu.end,
+                    )
+                });
+        if let Some((choice, open, selection, block, start, end)) = mark_choice {
+            if !open {
+                self.mark_menu = None;
+            }
+            if let Some(choice) = choice {
+                op = Some(Op::Mark {
+                    selection,
+                    block,
+                    start,
+                    end,
+                    kind: choice.kind,
+                    color: choice.color,
+                    toggle: choice.toggle,
+                });
+            }
+        }
+        // The bar stays up for a finished selection. It hides while the pointer
+        // is still dragging, so it doesn't sit under the cursor.
+        if bar_target.is_some() && ui.input(|i| i.pointer.is_decidedly_dragging()) {
+            bar_target = None;
+        }
+        if let Some((rect, selection, block, start, end)) = bar_target {
+            let (highlight, underline) = if selection {
+                self.selection
+                    .map(|sel| {
+                        (
+                            marks::shared_color(&self.doc, &sel, MarkKind::Highlight),
+                            marks::shared_color(&self.doc, &sel, MarkKind::Underline),
+                        )
+                    })
+                    .unwrap_or((None, None))
+            } else {
+                self.doc
+                    .blocks
+                    .get(block)
+                    .map(|block| mark_colors(&block.text, start, end))
+                    .unwrap_or((None, None))
+            };
+            match (self.bar_kind, highlight, underline) {
+                (MarkKind::Underline, _, Some(color)) => self.bar_color = color,
+                (_, Some(color), _) => {
+                    self.bar_kind = MarkKind::Highlight;
+                    self.bar_color = color;
+                }
+                (_, None, Some(color)) => {
+                    self.bar_kind = MarkKind::Underline;
+                    self.bar_color = color;
                 }
                 _ => {}
+            }
+            if let Some(action) =
+                crate::marks::show_bar(ui.ctx(), &palette, rect, self.bar_kind, self.bar_color)
+            {
+                match action {
+                    BarAction::Apply { kind, color } => {
+                        self.bar_kind = kind;
+                        self.bar_color = color;
+                        op = Some(Op::Mark {
+                            selection,
+                            block,
+                            start,
+                            end,
+                            kind,
+                            color: Some(color),
+                            toggle: false,
+                        });
+                    }
+                    BarAction::Clear => {
+                        op = Some(Op::ClearMarks {
+                            selection,
+                            block,
+                            start,
+                            end,
+                        });
+                    }
+                }
             }
         }
         if let Some(form) = &mut self.link_form {
@@ -835,7 +1313,9 @@ impl Editor {
         // Clicking the empty page below the last block starts typing there.
         let rest = ui.available_rect_before_wrap();
         let rest = rest.with_max_y(rest.max.y.max(rest.min.y + 200.0));
-        if ui.allocate_rect(rest, Sense::click()).clicked() {
+        // A menu choice this frame wins. The click that picked it can also land
+        // on the empty page, which would otherwise replace the choice.
+        if op.is_none() && ui.allocate_rect(rest, Sense::click()).clicked() {
             op = Some(Op::FocusEnd);
         }
 
@@ -851,7 +1331,9 @@ impl Editor {
 
         if op.is_none() {
             if let Some((index, caret)) = markdown_shortcut {
+                let outline_before = self.outline_keys();
                 if let Some(caret) = ops::apply_markdown_shortcut(&mut self.doc, index, caret) {
+                    self.rebind_outline(&outline_before);
                     op = Some(Op::Focus(caret));
                 }
             }
@@ -885,6 +1367,33 @@ impl Editor {
                         at: picker.at,
                         label: hit.label,
                         text: hit.text,
+                    }) {
+                        events.push(event);
+                    }
+                    if let Some(caret) = self.pending_caret.take() {
+                        self.caret_after_form = Some((caret, 1));
+                    }
+                }
+            }
+        }
+        if let Some(picker) = self.file_picker.as_mut() {
+            let outcome = picker.show(ui, &self.note_id, notes, &palette);
+            match outcome {
+                crate::file_menu::Outcome::Open => {}
+                crate::file_menu::Outcome::Cancel => {
+                    let picker = self.file_picker.take().expect("picker");
+                    self.pending_caret = Some(Caret {
+                        block: picker.block,
+                        char: picker.at,
+                    });
+                }
+                crate::file_menu::Outcome::Insert(choice) => {
+                    let picker = self.file_picker.take().expect("picker");
+                    if let Some(event) = self.apply(Op::InsertNoteLink {
+                        block: picker.block,
+                        at: picker.at,
+                        id: choice.id,
+                        title: choice.title,
                     }) {
                         events.push(event);
                     }
@@ -929,8 +1438,10 @@ impl Editor {
         let Some(snapshot) = snapshot else {
             return false;
         };
+        let outline_before = self.outline_keys();
         self.doc = snapshot.doc;
         self.doc.ensure_not_empty();
+        self.rebind_outline(&outline_before);
         self.galleys.clear();
         self.layouts.clear();
         self.selection = None;
@@ -1001,6 +1512,9 @@ impl Editor {
 
     /// Keys that cross block boundaries. Everything else goes to the text field.
     fn editing_keys(&mut self, ui: &mut Ui, i: usize, start: usize, end: usize) -> Option<Op> {
+        if let Some(op) = copy_citation(self, ui, i, start, end) {
+            return op;
+        }
         if let Some(op) = self.formatting_keys(ui, i, start, end) {
             return Some(op);
         }
@@ -1040,6 +1554,16 @@ impl Editor {
             });
         }
         if !matches!(self.doc.blocks[i].kind, BlockKind::Code { .. }) {
+            // A multi-line paste is blocks (a list, several paragraphs), not
+            // characters dropped into this line.
+            if let Some(text) = take_block_paste(ui) {
+                return Some(Op::InsertAt {
+                    block: i,
+                    start,
+                    end,
+                    text,
+                });
+            }
             if let Some(url) = take_pasted_url(ui) {
                 return Some(Op::InsertLink {
                     block: i,
@@ -1104,7 +1628,8 @@ impl Editor {
             if collapsed && !is_code && ui.input(|input| input.key_pressed(key)) {
                 let mut text = block.text.clone();
                 let deleted = citations::delete_ref_at_edge(&mut text, start, forward)
-                    .or_else(|| ops::delete_at_link_edge(&mut text, start, forward));
+                    .or_else(|| ops::delete_at_link_edge(&mut text, start, forward))
+                    .or_else(|| marks::delete_at_edge(&mut text, start, forward));
                 if let Some(char) = deleted {
                     consume(ui, key);
                     return Some(Op::SetText {
@@ -1120,11 +1645,8 @@ impl Editor {
             return Some(Op::DeleteForward(i));
         }
 
-        let prev = self.doc.blocks[..i].iter().rposition(|b| b.kind.has_text());
-        let next = self.doc.blocks[i + 1..]
-            .iter()
-            .position(|b| b.kind.has_text())
-            .map(|n| i + 1 + n);
+        let prev = self.neighbor_text(i, false);
+        let next = self.neighbor_text(i, true);
         let end_of = |b: usize| Caret {
             block: b,
             char: self.doc.blocks[b].text.chars().count(),
@@ -1319,7 +1841,7 @@ impl Editor {
     /// Draws the find bar (when open) with its top-right corner at
     /// `top_right`, and selects the current match when it closes.
     pub fn show_find_bar(&mut self, ctx: &egui::Context, top_right: Pos2, palette: &Palette) {
-        if let Some(m) = self.find.show(ctx, top_right, palette) {
+        if let Some(m) = self.find.show(ctx, top_right, palette, find_bar::NOTE_HINT) {
             self.selection = None;
             self.pending_caret = Some(Caret {
                 block: m.block,
@@ -1375,6 +1897,17 @@ impl Editor {
     /// Keys while a document selection is active.
     fn selection_keys(&mut self, ui: &mut Ui) -> Option<Op> {
         let sel = self.selection?;
+        if let Some((kind, color)) = take_mark_shortcut(ui) {
+            return Some(Op::Mark {
+                selection: true,
+                block: 0,
+                start: 0,
+                end: 0,
+                kind,
+                color: Some(color),
+                toggle: true,
+            });
+        }
         let (start, end) = sel.range();
         let extend = |head| Some(Op::Select(Selection::new(sel.anchor, head)));
         if let Some((key, m)) = take_arrow(ui, |_, _| true) {
@@ -1476,16 +2009,13 @@ impl Editor {
             };
         }
 
-        let target = if down {
-            caret.block + 1
-        } else if caret.block == 0 {
-            return Caret { block: 0, char: 0 };
-        } else {
-            caret.block - 1
+        let Some(target) = self.neighbor_block(caret.block, down) else {
+            return if down {
+                Selection::all(&self.doc).head
+            } else {
+                Caret { block: 0, char: 0 }
+            };
         };
-        if target >= self.doc.blocks.len() {
-            return Selection::all(&self.doc).head;
-        }
         let (Some(galley), Some(&(_, origin))) =
             (self.galleys.get(&target), self.layouts.get(&target))
         else {
@@ -1558,6 +2088,17 @@ impl Editor {
 
         let is_code = matches!(self.doc.blocks[i].kind, BlockKind::Code { .. });
         if !is_code {
+            if let Some((kind, color)) = take_mark_shortcut(ui) {
+                return Some(Op::Mark {
+                    selection: false,
+                    block: i,
+                    start,
+                    end,
+                    kind,
+                    color: Some(color),
+                    toggle: true,
+                });
+            }
             if consume_mods(ui, cmd_shift, Key::X) {
                 return Some(style("~~"));
             }
@@ -1963,6 +2504,67 @@ impl Editor {
         self.last_caret = Some((i, snapped));
     }
 
+    /// Runs a link-menu action. A replacement comes back as an operation.
+    fn apply_link_choice(
+        &mut self,
+        choice: link_menu::Choice,
+        target: LinkTarget,
+        ui: &Ui,
+    ) -> Option<Op> {
+        let text = self
+            .doc
+            .blocks
+            .get(target.block)
+            .map(|block| block.text.clone())
+            .filter(|text| target.still_in(text));
+        match choice {
+            link_menu::Choice::Copy => {
+                ui.ctx().copy_text(target.url.clone());
+                None
+            }
+            link_menu::Choice::Edit => {
+                if let Some(text) = text {
+                    self.link_form = Some(LinkForm::new(target, &text));
+                }
+                None
+            }
+            link_menu::Choice::Remove => text.map(|text| {
+                let label = text[target.label.clone()].to_string();
+                let (text, char) = target.replace(&text, &label);
+                Op::SetText {
+                    block: target.block,
+                    text,
+                    char,
+                    end: char,
+                }
+            }),
+            link_menu::Choice::ConvertToCitation => {
+                if let Some(text) = text {
+                    let title = if target.is_bare() {
+                        String::new()
+                    } else {
+                        inline::plain_text(&text[target.label.clone()])
+                    };
+                    self.citation_form = Some(CitationForm::from_link(target, title));
+                }
+                None
+            }
+            link_menu::Choice::Mark(choice) => text.map(|text| {
+                let start = ops::byte_to_char(&text, target.label.start);
+                let end = ops::byte_to_char(&text, target.label.end);
+                Op::Mark {
+                    selection: false,
+                    block: target.block,
+                    start,
+                    end,
+                    kind: choice.kind,
+                    color: choice.color,
+                    toggle: choice.toggle,
+                }
+            }),
+        }
+    }
+
     /// Opens a link on click, straight away, whether or not the block is
     /// being edited.
     fn link_click(
@@ -1971,6 +2573,7 @@ impl Editor {
         i: usize,
         output: &egui::text_edit::TextEditOutput,
         focused: bool,
+        notes: &[NoteMeta],
     ) -> Option<LinkPress> {
         let pos = ui.input(|input| input.pointer.hover_pos());
         let text = &self.doc.blocks[i].text;
@@ -1982,7 +2585,10 @@ impl Editor {
                 .filter(|id| self.doc.citations.iter().any(|c| &c.id == id));
             match citation {
                 Some(id) => Some(Target::Citation(id)),
-                None => inline::link_at(text, at).map(Target::Url),
+                None => inline::link_at(text, at).map(|url| match links::note_id(&url) {
+                    Some(id) => Target::Note(id),
+                    None => Target::Url(url),
+                }),
             }
         });
         let pressed = ui.input(|input| input.pointer.primary_pressed());
@@ -1990,6 +2596,18 @@ impl Editor {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             let hint = match target {
                 Target::Url(url) => url.clone(),
+                Target::Note(id) => notes
+                    .iter()
+                    .find(|note| &note.id == id)
+                    .map(|note| {
+                        let folder = note.folder();
+                        if folder.is_empty() {
+                            note.title.clone()
+                        } else {
+                            format!("{folder} — {}", note.title)
+                        }
+                    })
+                    .unwrap_or_else(|| "This note is no longer in the library".to_string()),
                 Target::Citation(id) => self
                     .doc
                     .citations
@@ -2090,6 +2708,7 @@ impl Editor {
     }
 
     fn apply(&mut self, op: Op) -> Option<Event> {
+        let outline_before = self.outline_keys();
         let doc = &mut self.doc;
         let mut event = Some(Event::Changed);
         self.pending_selection_end = None;
@@ -2177,6 +2796,23 @@ impl Editor {
                 let at = at.min(doc.blocks[block].text.chars().count());
                 Some(citations::insert_labeled(doc, block, at, &label, &text))
             }
+            Op::InsertNoteLink {
+                block,
+                at,
+                id,
+                title,
+            } => {
+                let block = block.min(doc.blocks.len() - 1);
+                let text = &mut doc.blocks[block].text;
+                let at = at.min(text.chars().count());
+                let byte = ops::char_to_byte(text, at);
+                let link = links::note_markdown(&id, &title);
+                text.insert_str(byte, &link);
+                Some(Caret {
+                    block,
+                    char: at + link.chars().count(),
+                })
+            }
             Op::SetText {
                 block,
                 text,
@@ -2263,6 +2899,24 @@ impl Editor {
                 let sel = self.selection.take()?;
                 Some(selection::replace(doc, &sel, &text))
             }
+            Op::InsertAt {
+                block,
+                start,
+                end,
+                text,
+            } => {
+                let (start, end) = (start.min(end), start.max(end));
+                let at = Caret { block, char: start };
+                if start == end {
+                    Some(selection::insert(doc, at, &text))
+                } else {
+                    Some(selection::replace(
+                        doc,
+                        &Selection::new(at, Caret { block, char: end }),
+                        &text,
+                    ))
+                }
+            }
             Op::SplitSelection => {
                 let sel = self.selection.take()?;
                 let at = selection::delete(doc, &sel);
@@ -2292,6 +2946,110 @@ impl Editor {
                     ops::toggle_inline(&mut doc.blocks[block].text, start, end, marker);
                 self.pending_selection_end = Some(end);
                 Some(Caret { block, char: start })
+            }
+            Op::Mark {
+                selection,
+                block,
+                start,
+                end,
+                kind,
+                color,
+                toggle,
+            } => {
+                if selection {
+                    if let Some(sel) = self.selection {
+                        let before: Vec<String> =
+                            doc.blocks.iter().map(|b| b.text.clone()).collect();
+                        let sel = marks::edit_selection(doc, &sel, kind, color, toggle);
+                        if doc
+                            .blocks
+                            .iter()
+                            .zip(&before)
+                            .all(|(b, old)| b.text == *old)
+                        {
+                            event = None;
+                        }
+                        self.selection = Some(sel);
+                    } else {
+                        event = None;
+                    }
+                    None
+                } else if doc
+                    .blocks
+                    .get(block)
+                    .is_some_and(|b| b.kind.has_text() && !matches!(b.kind, BlockKind::Code { .. }))
+                {
+                    let before = doc.blocks[block].text.clone();
+                    let (start, end) =
+                        marks::edit(&mut doc.blocks[block].text, start, end, kind, color, toggle);
+                    if doc.blocks[block].text == before {
+                        event = None;
+                    }
+                    self.pending_selection_end = Some(end);
+                    Some(Caret { block, char: start })
+                } else {
+                    event = None;
+                    None
+                }
+            }
+            Op::ClearMarks {
+                selection,
+                block,
+                start,
+                end,
+            } => {
+                if selection {
+                    if let Some(sel) = self.selection {
+                        let before: Vec<String> =
+                            doc.blocks.iter().map(|b| b.text.clone()).collect();
+                        let sel =
+                            marks::edit_selection(doc, &sel, MarkKind::Highlight, None, false);
+                        let sel =
+                            marks::edit_selection(doc, &sel, MarkKind::Underline, None, false);
+                        if doc
+                            .blocks
+                            .iter()
+                            .zip(&before)
+                            .all(|(b, old)| b.text == *old)
+                        {
+                            event = None;
+                        }
+                        self.selection = Some(sel);
+                    } else {
+                        event = None;
+                    }
+                    None
+                } else if doc
+                    .blocks
+                    .get(block)
+                    .is_some_and(|b| b.kind.has_text() && !matches!(b.kind, BlockKind::Code { .. }))
+                {
+                    let before = doc.blocks[block].text.clone();
+                    let (start, end) = marks::edit(
+                        &mut doc.blocks[block].text,
+                        start,
+                        end,
+                        MarkKind::Highlight,
+                        None,
+                        false,
+                    );
+                    let (start, end) = marks::edit(
+                        &mut doc.blocks[block].text,
+                        start,
+                        end,
+                        MarkKind::Underline,
+                        None,
+                        false,
+                    );
+                    if doc.blocks[block].text == before {
+                        event = None;
+                    }
+                    self.pending_selection_end = Some(end);
+                    Some(Caret { block, char: start })
+                } else {
+                    event = None;
+                    None
+                }
             }
             Op::Kind {
                 block,
@@ -2358,6 +3116,15 @@ impl Editor {
                             Some(ScripturePicker::new(block, char, self.menu_anchor));
                         None
                     }
+                    Action::InsertFileLink => {
+                        let char = crate::scripture_menu::restore_space(
+                            &mut doc.blocks[block].text,
+                            char,
+                            &space_before_slash,
+                        );
+                        self.file_picker = Some(FilePicker::new(block, char, self.menu_anchor));
+                        None
+                    }
                     other => {
                         event = Some(Event::Run(other));
                         Some(Caret { block, char })
@@ -2378,8 +3145,276 @@ impl Editor {
             block: c.block.min(doc.blocks.len() - 1),
             ..c
         });
+        self.rebind_outline(&outline_before);
         event
     }
+
+    /// The next or previous block that isn't hidden by a collapsed outline item.
+    fn neighbor_block(&self, from: usize, forward: bool) -> Option<usize> {
+        let len = self.doc.blocks.len();
+        let mut i = from;
+        loop {
+            if forward {
+                if i + 1 >= len {
+                    return None;
+                }
+                i += 1;
+            } else if i == 0 {
+                return None;
+            } else {
+                i -= 1;
+            }
+            if !self.hidden.get(i).copied().unwrap_or(false) {
+                return Some(i);
+            }
+        }
+    }
+
+    /// The next or previous block that holds text and isn't folded away.
+    fn neighbor_text(&self, from: usize, forward: bool) -> Option<usize> {
+        let mut i = from;
+        loop {
+            i = self.neighbor_block(i, forward)?;
+            if self.doc.blocks[i].kind.has_text() {
+                return Some(i);
+            }
+        }
+    }
+
+    fn recompute_hidden(&mut self) {
+        let n = self.doc.blocks.len();
+        let mut hidden = vec![false; n];
+        for i in 0..n {
+            if hidden[i] || !self.collapsed.contains(&i) {
+                continue;
+            }
+            if let Some(range) = self.doc.outline_child_range(i) {
+                for child in range {
+                    hidden[child] = true;
+                }
+            }
+        }
+        self.hidden = hidden;
+    }
+
+    /// Opens every collapsed ancestor of `index`.
+    fn reveal_outline(&mut self, index: usize) {
+        let mut i = 0;
+        while i < index && i < self.doc.blocks.len() {
+            if self.collapsed.contains(&i)
+                && self
+                    .doc
+                    .outline_child_range(i)
+                    .is_some_and(|range| range.contains(&index))
+            {
+                self.collapsed.remove(&i);
+            }
+            i += 1;
+        }
+    }
+
+    /// First-line identity of each block, so a collapsed item can be found
+    /// again after blocks are inserted or removed. Empty when nothing is folded.
+    fn outline_keys(&self) -> Vec<String> {
+        if self.collapsed.is_empty() {
+            return Vec::new();
+        }
+        self.doc.blocks.iter().map(outline_key).collect()
+    }
+
+    fn rebind_outline(&mut self, before: &[String]) {
+        if before.is_empty() || self.collapsed.is_empty() {
+            return;
+        }
+        let after: Vec<String> = self.doc.blocks.iter().map(outline_key).collect();
+        self.collapsed = rebind_collapsed(&self.collapsed, before, &after);
+        self.collapsed
+            .retain(|&i| self.doc.outline_child_range(i).is_some());
+    }
+
+    /// The margin number. When this paragraph has sub items, clicking it
+    /// folds them. A chevron beside the number shows that they're hidden.
+    fn paragraph_number(
+        &mut self,
+        ui: &mut Ui,
+        i: usize,
+        n: usize,
+        right: f32,
+        center_y: f32,
+        palette: &Palette,
+    ) {
+        let collapsed = self.collapsed.contains(&i);
+        let has_children = self.doc.outline_child_range(i).is_some();
+        let color = if collapsed {
+            palette.text
+        } else {
+            palette.subtle
+        };
+        let galley = ui
+            .painter()
+            .layout_no_wrap(n.to_string(), FontId::proportional(12.0), color);
+        let text_pos = egui::pos2(right - galley.size().x, center_y - galley.size().y / 2.0);
+        if has_children {
+            let hit = Rect::from_min_max(
+                egui::pos2(text_pos.x - 16.0, center_y - 11.0),
+                egui::pos2(right + 2.0, center_y + 11.0),
+            );
+            let response = ui.interact(hit, self.block_id(i).with("outline"), Sense::click());
+            let label = if collapsed {
+                format!("Expand outline {i}")
+            } else {
+                format!("Collapse outline {i}")
+            };
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone())
+            });
+            if response.hovered() {
+                ui.painter().rect_filled(hit, 4.0, palette.hover);
+            }
+            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                self.toggle_outline(ui, i);
+            }
+            // Right-pointing when the sub items are hidden; a faint one on
+            // hover while they're open, so the control can be found.
+            if collapsed || response.hovered() {
+                crate::icons::chevron(
+                    ui.painter(),
+                    egui::pos2(text_pos.x - 8.0, center_y),
+                    !self.collapsed.contains(&i),
+                    if self.collapsed.contains(&i) {
+                        palette.text
+                    } else {
+                        palette.faint
+                    },
+                );
+            }
+        }
+        ui.painter().galley(text_pos, galley, color);
+    }
+
+    fn toggle_outline(&mut self, ui: &mut Ui, i: usize) {
+        let Some(range) = self.doc.outline_child_range(i) else {
+            return;
+        };
+        if self.collapsed.contains(&i) {
+            self.collapsed.remove(&i);
+            self.recompute_hidden();
+            self.outline_dirty = true;
+            return;
+        }
+        let parent_id = self.block_id(i);
+        // A click outside the text field drops focus before this runs, so
+        // the caret's block is the one that had it last frame.
+        let caret_at = self.last_focus;
+        let parent_focused = caret_at == Some(i) || ui.memory(|m| m.has_focus(parent_id));
+        let child_focused = caret_at.is_some_and(|c| range.contains(&c))
+            || range
+                .clone()
+                .any(|c| ui.memory(|m| m.has_focus(self.block_id(c))));
+        self.collapsed.insert(i);
+        if child_focused {
+            for c in range {
+                let id = self.block_id(c);
+                if ui.memory(|m| m.has_focus(id)) {
+                    ui.memory_mut(|m| m.surrender_focus(id));
+                }
+            }
+            // Keep typing on the item that stayed visible.
+            self.pending_caret = Some(Caret {
+                block: i,
+                char: self.doc.blocks[i].text.chars().count(),
+            });
+            self.pending_selection_end = None;
+        }
+        self.recompute_hidden();
+        self.outline_dirty = true;
+        if parent_focused {
+            ui.memory_mut(|m| m.request_focus(parent_id));
+        }
+    }
+}
+
+/// Maps collapsed block indices from `before` onto `after`.
+///
+/// Matching lines follow the longest common subsequence. An item whose own
+/// text changed (typed in, or split with Enter) stays at its index when that
+/// slot is still the same outline item.
+fn rebind_collapsed(
+    collapsed: &HashSet<usize>,
+    before: &[String],
+    after: &[String],
+) -> HashSet<usize> {
+    let map = lcs_index_map(before, after);
+    let taken: HashSet<usize> = map.iter().flatten().copied().collect();
+    let mut out = HashSet::new();
+    for &i in collapsed {
+        if let Some(j) = map.get(i).and_then(|j| *j) {
+            out.insert(j);
+            continue;
+        }
+        if !taken.contains(&i)
+            && before
+                .get(i)
+                .zip(after.get(i))
+                .is_some_and(|(old, new)| same_outline_item(old, new))
+        {
+            out.insert(i);
+        }
+    }
+    out
+}
+
+fn same_outline_item(old: &str, new: &str) -> bool {
+    let Some((old_kind, old_line)) = old.split_once(':') else {
+        return false;
+    };
+    let Some((new_kind, new_line)) = new.split_once(':') else {
+        return false;
+    };
+    if old_kind != new_kind {
+        return false;
+    }
+    if old_line == new_line {
+        return true;
+    }
+    let (short, long) = if old_line.len() <= new_line.len() {
+        (old_line, new_line)
+    } else {
+        (new_line, old_line)
+    };
+    !short.is_empty() && long.starts_with(short)
+}
+
+/// For each index in `before`, the index of that same line in `after`.
+fn lcs_index_map(before: &[String], after: &[String]) -> Vec<Option<usize>> {
+    let n = before.len();
+    let m = after.len();
+    let mut dp = vec![0u32; (n + 1) * (m + 1)];
+    let ix = |i: usize, j: usize| i * (m + 1) + j;
+    for i in 1..=n {
+        for j in 1..=m {
+            dp[ix(i, j)] = if before[i - 1] == after[j - 1] {
+                dp[ix(i - 1, j - 1)] + 1
+            } else {
+                dp[ix(i - 1, j)].max(dp[ix(i, j - 1)])
+            };
+        }
+    }
+    let mut map = vec![None; n];
+    let (mut i, mut j) = (n, m);
+    while i > 0 && j > 0 {
+        if before[i - 1] == after[j - 1] {
+            map[i - 1] = Some(j - 1);
+            i -= 1;
+            j -= 1;
+        } else if dp[ix(i - 1, j)] >= dp[ix(i, j - 1)] {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    map
 }
 
 /// How far an arrow key moves, from its modifiers: macOS uses Option for
@@ -2437,6 +3472,49 @@ fn consume(ui: &mut Ui, key: Key) -> bool {
     consume_mods(ui, Modifiers::NONE, key)
 }
 
+/// ⌘⇧H highlights in yellow. ⌘U underlines in blue. The same shortcut again
+/// removes that annotation.
+fn take_mark_shortcut(ui: &mut Ui) -> Option<(MarkKind, u32)> {
+    let cmd = Modifiers::COMMAND;
+    let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+    if consume_mods(ui, cmd_shift, Key::H) {
+        return Some((MarkKind::Highlight, DEFAULT_HIGHLIGHT));
+    }
+    if consume_mods(ui, cmd, Key::U) {
+        return Some((MarkKind::Underline, DEFAULT_UNDERLINE));
+    }
+    None
+}
+
+/// The first line of characters `from..to`, in screen coordinates.
+fn span_rect(galley: &Galley, origin: Pos2, from: usize, to: usize) -> Option<Rect> {
+    let mut row_start = 0;
+    for row in &galley.rows {
+        let row_end = row_start + row.char_count_excluding_newline().0;
+        if from < row_end && to > row_start {
+            let lo = from.max(row_start);
+            let hi = to.min(row_end);
+            let x0 = origin.x + row.pos.x + row.x_offset((lo - row_start).into());
+            let x1 = origin.x + row.pos.x + row.x_offset((hi - row_start).into());
+            if x1 > x0 {
+                return Some(Rect::from_x_y_ranges(
+                    x0..=x1,
+                    origin.y + row.min_y()..=origin.y + row.max_y(),
+                ));
+            }
+        }
+        row_start += row.char_count_including_newline().0;
+    }
+    None
+}
+
+fn mark_colors(text: &str, start: usize, end: usize) -> (Option<u32>, Option<u32>) {
+    (
+        marks::active_color(text, start, end, MarkKind::Highlight),
+        marks::active_color(text, start, end, MarkKind::Underline),
+    )
+}
+
 fn consume_mods(ui: &mut Ui, modifiers: Modifiers, key: Key) -> bool {
     ui.input_mut(|i| i.consume_key(modifiers, key))
 }
@@ -2492,28 +3570,7 @@ fn selection_rects(
     continues: bool,
     color: Color32,
 ) -> Vec<Shape> {
-    let mut shapes = Vec::new();
-    let mut row_start = 0;
-    let rows = galley.rows.len();
-    for (n, row) in galley.rows.iter().enumerate() {
-        let row_end = row_start + row.char_count_excluding_newline().0;
-        let past_end = (to > row_end && row.ends_with_newline) || (continues && n + 1 == rows);
-        if from <= row_end && to >= row_start && (to > from || past_end) {
-            let (lo, hi) = (from.max(row_start), to.min(row_end));
-            let x0 = row.pos.x + row.x_offset((lo - row_start).into());
-            let sliver = if past_end { 6.0 } else { 0.0 };
-            let x1 = row.pos.x + row.x_offset((hi - row_start).into()) + sliver;
-            if x1 > x0 {
-                let rect = Rect::from_x_y_ranges(
-                    origin.x + x0..=origin.x + x1,
-                    origin.y + row.min_y()..=origin.y + row.max_y(),
-                );
-                shapes.push(Shape::rect_filled(rect, 0.0, color));
-            }
-        }
-        row_start += row.char_count_including_newline().0;
-    }
-    shapes
+    find_bar::highlight_shapes(galley, origin, from, to, continues, color)
 }
 
 /// The URL of the link drawn under `pos` (relative to the galley), if any.
@@ -2543,6 +3600,123 @@ fn char_under(galley: &Galley, pos: egui::Vec2, text: &str) -> Option<usize> {
         (a..b).contains(&pos.x) && (row.min.y..=row.max.y).contains(&pos.y)
     })?;
     Some(ops::char_to_byte(text, hit))
+}
+
+#[cfg(test)]
+mod outline_rebind_tests {
+    use super::rebind_collapsed;
+    use std::collections::HashSet;
+
+    fn keys(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn set(indices: &[usize]) -> HashSet<usize> {
+        indices.iter().copied().collect()
+    }
+
+    #[test]
+    fn inserting_a_block_before_a_folded_item_keeps_it_folded() {
+        let before = keys(&["p:A", "p:\ta", "p:B", "p:\tb"]);
+        let after = keys(&["p:A", "p:new", "p:\ta", "p:B", "p:\tb"]);
+        assert_eq!(rebind_collapsed(&set(&[2]), &before, &after), set(&[3]));
+    }
+
+    #[test]
+    fn splitting_a_folded_item_keeps_it_folded() {
+        let before = keys(&["p:Parent long", "p:\tchild"]);
+        let after = keys(&["p:Parent", "p:long", "p:\tchild"]);
+        assert_eq!(rebind_collapsed(&set(&[0]), &before, &after), set(&[0]));
+    }
+
+    #[test]
+    fn restore_collapsed_picks_the_matching_occurrence() {
+        use scripture_study_core::{
+            document::outline_key, settings::CollapsedOutline, Block, Document,
+        };
+
+        let doc = Document::new(vec![
+            Block::paragraph("Parent"),
+            Block::paragraph("\tChild"),
+            Block::paragraph("Parent"),
+            Block::paragraph("\tOther child"),
+        ]);
+        let mut editor = super::Editor::new("n", doc);
+        let second = CollapsedOutline {
+            key: outline_key(&Block::paragraph("Parent")),
+            nth: 1,
+        };
+        editor.restore_collapsed(&[second.clone()]);
+        assert!(editor.collapsed.contains(&2));
+        assert!(!editor.collapsed.contains(&0));
+        assert_eq!(editor.collapsed_outline(), vec![second]);
+    }
+
+    #[test]
+    fn deleting_a_folded_item_drops_it() {
+        let before = keys(&["p:Parent", "p:\tchild", "p:Sibling"]);
+        let after = keys(&["p:\tchild", "p:Sibling"]);
+        assert_eq!(rebind_collapsed(&set(&[0]), &before, &after), set(&[]));
+    }
+}
+
+/// Copy or cut inside one block. A superscript's source is not in the
+/// block's text, so the clipboard gets the selection plus its footnote
+/// lines. `Some(None)` means the copy was handled and there is nothing
+/// further to do.
+fn copy_citation(
+    editor: &Editor,
+    ui: &mut Ui,
+    block: usize,
+    start: usize,
+    end: usize,
+) -> Option<Option<Op>> {
+    if matches!(editor.doc.blocks.get(block)?.kind, BlockKind::Code { .. }) || start == end {
+        return None;
+    }
+    let (from, to) = (start.min(end), start.max(end));
+    let text = &editor.doc.blocks[block].text;
+    let slice = &text[ops::char_to_byte(text, from)..ops::char_to_byte(text, to)];
+    let markdown = citations::with_definitions(&editor.doc, slice);
+    if markdown == slice {
+        return None;
+    }
+    let cut = ui.input_mut(|input| {
+        let n = input
+            .events
+            .iter()
+            .position(|event| matches!(event, egui::Event::Copy | egui::Event::Cut))?;
+        match input.events.remove(n) {
+            egui::Event::Cut => Some(true),
+            _ => Some(false),
+        }
+    })?;
+    ui.ctx().copy_text(markdown);
+    if cut {
+        Some(Some(Op::InsertAt {
+            block,
+            start: from,
+            end: to,
+            text: String::new(),
+        }))
+    } else {
+        Some(None)
+    }
+}
+
+/// Takes a multi-line paste out of this frame's input. A single line is left
+/// for the text field.
+fn take_block_paste(ui: &mut Ui) -> Option<String> {
+    ui.input_mut(|input| {
+        let n = input
+            .events
+            .iter()
+            .position(|e| matches!(e, egui::Event::Paste(text) if text.contains('\n')))?;
+        match input.events.remove(n) {
+            egui::Event::Paste(text) => Some(text),
+            _ => None,
+        }
+    })
 }
 
 /// Takes a paste of a single URL out of this frame's input.

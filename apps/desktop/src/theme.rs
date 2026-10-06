@@ -227,6 +227,21 @@ fn weight(w: f32) -> VariationCoords {
     VariationCoords::new([(b"wght", w)])
 }
 
+/// Underline ink. Pastel swatches are darkened on a light page so the line
+/// stays visible; on a dark page the swatch color is already light enough.
+fn underline_ink(color: u32, dark: bool) -> Color32 {
+    let (r, g, b) = inline::color_rgb(color);
+    if dark {
+        Color32::from_rgb(r, g, b)
+    } else {
+        Color32::from_rgb(
+            ((u16::from(r) * 58) / 100) as u8,
+            ((u16::from(g) * 58) / 100) as u8,
+            ((u16::from(b) * 58) / 100) as u8,
+        )
+    }
+}
+
 /// Lays out a block's raw Markdown as rich text. Inline delimiters are shown
 /// faintly while `show_markers` (the block is being edited) and hidden
 /// otherwise. Link markup is always hidden, so a link reads as just its label.
@@ -293,6 +308,12 @@ pub fn layout(
             format.color = if muted { palette.faint } else { palette.accent };
             format.underline = Stroke::new(1.0, format.color.gamma_multiply(0.5));
         }
+        let dark = ui.visuals().dark_mode;
+        if let Some(color) = style.highlight {
+            let (r, g, b) = inline::color_rgb(color);
+            let alpha = if dark { 80 } else { 170 };
+            format.background = Color32::from_rgba_unmultiplied(r, g, b, alpha);
+        }
         if style.footnote {
             // A citation number: small, raised, and in the link color.
             format.font_id.size = size * 0.62;
@@ -300,6 +321,9 @@ pub fn layout(
             format.coords = weight(600.0);
             format.color = if muted { palette.faint } else { palette.accent };
             format.underline = Stroke::NONE;
+        }
+        if let Some(color) = style.underline {
+            format.underline = Stroke::new(1.6, underline_ink(color, dark));
         }
         if style.strike || muted {
             format.strikethrough = Stroke::new(1.0, color);

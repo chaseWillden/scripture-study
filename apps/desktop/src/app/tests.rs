@@ -1124,6 +1124,34 @@ fn drag_inside_one_block_is_a_normal_text_selection() {
 }
 
 #[test]
+fn pasting_a_list_into_a_list_item_keeps_the_rest() {
+    let mut f = Fixture::with_note("1. Alpha\n2. Beta\n3. Gamma\n");
+    // The caret starts at the end of Gamma. Move to the end of Beta, in the
+    // middle of the list, and paste another list there.
+    f.press(Key::ArrowUp);
+    f.harness
+        .event(egui::Event::Paste("1. One\n\t1. Nested\n2. Two".into()));
+    f.harness.run();
+    assert_eq!(
+        f.texts(),
+        ["Alpha", "Beta", "One", "Nested", "Two", "Gamma"]
+    );
+    let indents: Vec<u8> = f.app().editor.doc.blocks.iter().map(|b| b.indent).collect();
+    assert_eq!(indents, [0, 0, 0, 1, 0, 0]);
+    assert_eq!(
+        f.app().editor.doc.list_number(4),
+        4,
+        "Two continues the list"
+    );
+    assert_eq!(f.app().editor.doc.list_number(3), 1, "Nested starts at 1");
+    assert_eq!(
+        f.app().editor.doc.list_number(5),
+        5,
+        "Gamma keeps its place"
+    );
+}
+
+#[test]
 fn pasting_over_a_selection_inserts_blocks() {
     let mut f = Fixture::with_note(THREE_BLOCKS);
     f.shortcut(Key::A);
@@ -1799,6 +1827,106 @@ fn tabbing_a_paragraph_restarts_its_number() {
 }
 
 #[test]
+fn collapsing_an_outline_item_hides_its_sub_items() {
+    let mut f =
+        Fixture::with_note("Parent\n\n\tChild one\n\n\tChild two\n\n\t\tGrandchild\n\nSibling\n");
+    assert_eq!(
+        f.texts(),
+        [
+            "Parent",
+            "\tChild one",
+            "\tChild two",
+            "\t\tGrandchild",
+            "Sibling"
+        ]
+    );
+    // Only items that have something nested under them can fold.
+    assert!(f.harness.query_by_label("Collapse outline 0").is_some());
+    assert!(f.harness.query_by_label("Collapse outline 1").is_none());
+    assert!(f.harness.query_by_label("Collapse outline 2").is_some());
+
+    // The note opens with the caret in the last block. Walk up to the parent
+    // before folding, so the click doesn't have to find the caret.
+    for _ in 0..4 {
+        f.press(Key::ArrowUp);
+    }
+    f.click("Collapse outline 0");
+    assert!(f.harness.query_by_label("Expand outline 0").is_some());
+    assert!(
+        f.harness.query_by_label("Collapse outline 2").is_none(),
+        "sub items are hidden"
+    );
+    assert_eq!(
+        f.texts(),
+        [
+            "Parent",
+            "\tChild one",
+            "\tChild two",
+            "\t\tGrandchild",
+            "Sibling"
+        ],
+        "folding doesn't delete anything"
+    );
+    f.snapshot("outline_collapsed");
+
+    // Arrow down skips the hidden sub items.
+    f.press(Key::ArrowDown);
+    f.type_text("X");
+    assert_eq!(f.texts()[4], "XSibling");
+    assert_eq!(f.texts()[1], "\tChild one");
+
+    f.click("Expand outline 0");
+    assert!(f.harness.query_by_label("Collapse outline 2").is_some());
+
+    // Folding a nested item hides only its own sub items.
+    f.click("Collapse outline 2");
+    assert!(f.harness.query_by_label("Expand outline 2").is_some());
+    assert!(f.harness.query_by_label("Collapse outline 0").is_some());
+    f.snapshot("outline_nested_collapsed");
+}
+
+#[test]
+fn collapsed_outline_is_remembered_in_the_notes_folder() {
+    let mut f = Fixture::with_notes(&[
+        ("other", "Other\n"),
+        (
+            "outline",
+            "Parent\n\n\tChild\n\n\t\tGrandchild\n\nSibling\n",
+        ),
+    ]);
+    assert_eq!(f.app().current, "outline");
+    f.click("Collapse outline 0");
+
+    let settings = fs::read_to_string(f.dir.path().join(".scripture-study")).unwrap();
+    assert!(
+        settings.contains("\"version\": 1"),
+        "settings file:\n{settings}"
+    );
+    assert!(settings.contains("p:Parent"), "settings file:\n{settings}");
+    // The other note in this folder has no entry of its own yet.
+    assert!(!settings.contains("other"));
+
+    f.click("Other");
+    assert_eq!(f.app().current, "other");
+    f.click("Parent");
+    assert_eq!(f.app().current, "outline");
+    assert!(
+        f.harness.query_by_label("Expand outline 0").is_some(),
+        "the parent stays folded"
+    );
+    assert!(
+        f.harness.query_by_label("Collapse outline 1").is_none(),
+        "its sub items stay hidden"
+    );
+
+    f.click("Expand outline 0");
+    assert!(
+        !f.dir.path().join(".scripture-study").exists(),
+        "an unfolded note leaves no settings file"
+    );
+}
+
+#[test]
 fn paragraph_numbers_snapshot() {
     let mut f = Fixture::with_note(
         "# Isaiah 53\n\nWho hath believed our report?\n\nFor he shall grow up before him as a tender plant, and as a root out of a dry ground: he hath no form nor comeliness; and when we shall see him, there is no beauty that we should desire him.\n\n- a list item\n\nHe is despised and rejected of men.\n",
@@ -2122,6 +2250,54 @@ fn slash_scripture_cites_the_reference_instead_of_a_number() {
 }
 
 #[test]
+fn slash_file_link_inserts_a_title_that_opens_the_note() {
+    let mut f = Fixture::with_notes(&[
+        ("My Notes/grace", "# Grace\n\nA talk about grace.\n"),
+        ("journal", "# Journal\n\n"),
+    ]);
+    assert_eq!(f.app().current, "journal");
+    f.press(Key::Enter);
+    f.type_text("See /file-link");
+    f.press(Key::Enter);
+    assert!(
+        f.harness.get_all_by_label("Grace").count() >= 2,
+        "the document list opened beside the sidebar"
+    );
+    f.snapshot("file_link_picker");
+    f.press(Key::Escape);
+    assert_eq!(f.texts(), ["Journal", "See "], "cancel removes the command");
+
+    f.type_text("/file-link");
+    f.press(Key::Enter);
+    f.type_text("Grace");
+    f.snapshot("file_link_picker_results");
+    f.press(Key::Enter);
+    assert_eq!(f.texts(), ["Journal", "See [Grace](note:My%20Notes/grace)"]);
+
+    let text = "See [Grace](note:My%20Notes/grace)";
+    let pos = block_rect(&f, text).left_center() + egui::vec2(50.0, 0.0);
+    f.harness.hover_at(pos);
+    f.harness.run();
+    for pressed in [true, false] {
+        f.harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        f.harness.step();
+    }
+    f.harness.run();
+    assert_eq!(f.app().current, "My Notes/grace");
+    assert_eq!(f.texts(), ["Grace", "A talk about grace."]);
+    let journal = fs::read_to_string(f.dir.path().join("journal.md")).unwrap();
+    assert!(
+        journal.contains("[Grace](note:My%20Notes/grace)"),
+        "{journal}"
+    );
+}
+
+#[test]
 fn a_citation_added_before_others_renumbers_them() {
     let mut f = Fixture::with_note(
         "First thought\n\nSecond thought[^1]\n\n[^1]: Smith, Jane. *Later Book*. 2001.\n",
@@ -2157,6 +2333,69 @@ fn a_citation_added_before_others_renumbers_them() {
             ),
         ]
     );
+}
+
+#[test]
+fn copying_a_superscript_inside_a_block_brings_its_citation() {
+    let mut f = Fixture::with_note("City[^1] was besieged.\n\n[^1]: Tablets.\n");
+    f.harness
+        .state_mut()
+        .editor
+        .place_caret(0, "City[^1]".len());
+    f.harness.run();
+    // The hidden `[^` `]` have no width, so one arrow selects the superscript.
+    f.harness
+        .key_press_modifiers(egui::Modifiers::SHIFT, Key::ArrowLeft);
+    f.harness.run();
+    let copied = clipboard_after(&mut f, egui::Event::Copy).unwrap();
+    assert_eq!(copied, "[^1]\n\n[^1]: Tablets.");
+
+    f.harness
+        .state_mut()
+        .editor
+        .place_caret(0, "City[^1] was besieged.".len());
+    f.harness.run();
+    f.harness.event(egui::Event::Paste(copied));
+    f.harness.run();
+    assert_eq!(f.texts(), ["City[^1] was besieged.[^1]"]);
+    assert_eq!(f.app().editor.doc.citations.len(), 1);
+    assert_eq!(f.app().editor.doc.citations[0].text, "Tablets.");
+}
+
+#[test]
+fn pasting_a_copied_list_into_another_note_brings_its_citations() {
+    let mut f = Fixture::with_notes(&[
+        ("page", ""),
+        (
+            "sources",
+            "1. The city was besieged[^1]\n2. Lehi saw it destroyed[^1 Nephi 1:4]\n\n[^1]: Tablets.\n[^1 Nephi 1:4]: Jerusalem.\n",
+        ),
+    ]);
+    f.shortcut(Key::A);
+    let copied = clipboard_after(&mut f, egui::Event::Copy).unwrap();
+    assert!(copied.contains("[^1]: Tablets."), "{copied}");
+    assert!(copied.contains("[^1 Nephi 1:4]: Jerusalem."), "{copied}");
+
+    f.click("Untitled");
+    assert_eq!(f.app().current, "page");
+    f.harness.event(egui::Event::Paste(copied));
+    f.harness.run();
+    assert_eq!(
+        f.texts(),
+        [
+            "The city was besieged[^1]",
+            "Lehi saw it destroyed[^1 Nephi 1:4]"
+        ]
+    );
+    let list: Vec<_> = f
+        .app()
+        .editor
+        .doc
+        .citations
+        .iter()
+        .map(|c| (c.id.as_str(), c.text.as_str()))
+        .collect();
+    assert_eq!(list, [("1", "Tablets."), ("1 Nephi 1:4", "Jerusalem.")]);
 }
 
 #[test]
@@ -2450,6 +2689,59 @@ fn scriptures_page_opens_a_book_then_its_chapter() {
 }
 
 #[test]
+fn cmd_f_finds_in_the_open_chapter() {
+    let mut f = Fixture::with_note("# Note\n\nKeep me.\n");
+    f.click("Scriptures");
+    f.click("Genesis");
+    f.click("Chapter 1");
+    let verse = "In the beginning God created the heaven and the earth.";
+
+    f.shortcut(Key::F);
+    assert!(f.app().scriptures.chapter_find.open);
+    assert!(!f.app().editor.find.open, "Cmd+F stays on the chapter");
+    assert!(f
+        .harness
+        .query_by(|node| node.placeholder() == Some("Find in chapter"))
+        .is_some());
+
+    f.type_text("firmament");
+    assert_eq!(f.app().scriptures.chapter_find.matches.len(), 9);
+    assert!(shows_count(&f, "1 of 9"), "expected 1 of 9");
+    f.snapshot("scriptures_find");
+
+    f.press(Key::Enter);
+    assert!(shows_count(&f, "2 of 9"), "expected 2 of 9");
+    f.click("Previous match");
+    assert_eq!(f.app().scriptures.chapter_find.current, 0);
+
+    // A typo matches only with fuzzy on, and the field keeps focus.
+    f.shortcut(Key::F);
+    f.type_text("firmamant");
+    assert_eq!(f.app().scriptures.chapter_find.query, "firmamant");
+    assert!(shows_count(&f, "No results"), "expected No results");
+    f.click("Fuzzy");
+    assert!(f.app().scriptures.chapter_find.fuzzy);
+    assert!(
+        !f.app().scriptures.chapter_find.matches.is_empty(),
+        "fuzzy finds firmament"
+    );
+    f.snapshot("scriptures_find_fuzzy");
+
+    // Escape closes the bar and stays on the chapter.
+    f.press(Key::Escape);
+    assert!(!f.app().scriptures.chapter_find.open);
+    assert!(f.harness.query_by_label(verse).is_some());
+    assert_eq!(f.texts(), ["Note", "Keep me."]);
+
+    // The next chapter is a new search.
+    f.shortcut(Key::F);
+    f.type_text("firmament");
+    assert!(shows_count(&f, "1 of 9"), "expected 1 of 9");
+    f.click("Next chapter");
+    assert!(shows_count(&f, "No results"), "Genesis 2 has no firmament");
+}
+
+#[test]
 fn scriptures_filter_and_search() {
     let mut f = Fixture::with_note("# Note\n\nKeep me.\n");
     f.click("Scriptures");
@@ -2482,4 +2774,108 @@ fn scriptures_filter_and_search() {
         .query_by_label("In the beginning God created the heaven and the earth.")
         .is_some());
     assert_eq!(f.texts(), ["Note", "Keep me."]);
+}
+
+#[test]
+fn right_clicking_a_misspelling_offers_a_fix_ignore_all_and_the_dictionary() {
+    let mut f = Fixture::with_note("helo there\n\nhelo again\n");
+    let path = f.dir.path().join("dictionary");
+    f.harness.state_mut().spelling = crate::spell::Spelling::for_test(
+        Some(path.clone()),
+        &["there", "again"],
+        &[("helo", &["hello"])],
+    );
+    f.harness.run();
+
+    let pos = block_rect(&f, "helo there").left_center() + egui::vec2(12.0, 0.0);
+    click_with(&mut f, pos, egui::PointerButton::Secondary);
+    for item in ["hello", "Ignore All", "Add to Dictionary"] {
+        assert!(f.harness.query_by_label(item).is_some(), "{item} missing");
+    }
+
+    f.click_menu_item("hello");
+    assert_eq!(f.texts(), ["hello there", "helo again"]);
+    assert!(
+        f.harness.query_by_label("Ignore All").is_none(),
+        "the menu closed"
+    );
+
+    let pos = block_rect(&f, "helo again").left_center() + egui::vec2(12.0, 0.0);
+    click_with(&mut f, pos, egui::PointerButton::Secondary);
+    f.click_menu_item("Add to Dictionary");
+    assert!(
+        f.harness
+            .state_mut()
+            .spelling
+            .misspellings("helo again")
+            .is_empty(),
+        "the added word is no longer misspelled"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "helo\n");
+
+    // Ignore All covers every later copy, not just the one that was clicked.
+    f.harness.state_mut().spelling =
+        crate::spell::Spelling::for_test(None, &["there", "again"], &[("helo", &["hello"])]);
+    f.harness.run();
+    click_with(&mut f, pos, egui::PointerButton::Secondary);
+    f.click_menu_item("Ignore All");
+    let spelling = &mut f.harness.state_mut().spelling;
+    assert!(spelling.misspellings("helo again").is_empty());
+    assert!(spelling.misspellings("helo there").is_empty());
+}
+
+#[test]
+fn highlight_and_underline_save_and_come_back() {
+    let mut f = Fixture::new();
+    type_steadily(&mut f, "hope");
+    f.shortcut_mods(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::H);
+    assert_eq!(f.texts(), ["<mark #FFE08A>hope</mark>"]);
+    f.shortcut_mods(egui::Modifiers::COMMAND, Key::U);
+    assert_eq!(f.texts(), ["<u #9EC7F5><mark #FFE08A>hope</mark></u>"]);
+    // The same highlight shortcut removes only the highlight.
+    f.shortcut_mods(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::H);
+    assert_eq!(f.texts(), ["<u #9EC7F5>hope</u>"]);
+    let saved = f.saved_markdown();
+    assert!(saved.contains("<u #9EC7F5>hope</u>"), "{saved}");
+
+    let reopened = Fixture::with_note(&saved);
+    assert_eq!(reopened.texts(), ["<u #9EC7F5>hope</u>"]);
+}
+
+#[test]
+fn opening_a_folder_loads_annotations() {
+    let markdown = "A <mark #F5B3CE>hope</mark> and <u #9EC7F5>faith</u>.\n";
+    let f = Fixture::with_notes(&[("Notes/study", markdown)]);
+    assert_eq!(
+        f.texts(),
+        ["A <mark #F5B3CE>hope</mark> and <u #9EC7F5>faith</u>."]
+    );
+}
+
+#[test]
+fn selecting_text_shows_the_highlight_bar() {
+    let mut f = Fixture::with_note("hope\n");
+    for _ in 0.."hope".len() {
+        f.shortcut_mods(egui::Modifiers::SHIFT, Key::ArrowLeft);
+    }
+    assert!(f.harness.query_by_label("Highlight").is_some());
+    assert!(f.harness.query_by_label("Underline").is_some());
+    assert!(f.harness.query_by_label("Clear").is_some());
+    assert!(
+        f.harness.query_by_label("Color Pink").is_some(),
+        "the color strip is part of the bar"
+    );
+
+    f.click_menu_item("Color Pink");
+    assert_eq!(f.texts(), ["<mark #F5B3CE>hope</mark>"]);
+    assert!(
+        f.harness.query_by_label("Underline").is_some(),
+        "the selection stays, so the bar stays"
+    );
+
+    f.click_menu_item("Underline");
+    assert!(f.texts()[0].contains("<u #F5B3CE>"), "{:?}", f.texts());
+
+    f.click_menu_item("Clear");
+    assert_eq!(f.texts(), ["hope"]);
 }

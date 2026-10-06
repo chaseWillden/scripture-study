@@ -128,6 +128,59 @@ pub fn label(url: &str) -> String {
     out
 }
 
+/// Prefix of a link that opens another note in the library.
+const NOTE_PREFIX: &str = "note:";
+
+/// `note:…` address for note `id`. Spaces and other reserved characters are
+/// percent-encoded so the address can sit inside a Markdown link.
+pub fn note_url(id: &str) -> String {
+    let mut url = String::from(NOTE_PREFIX);
+    for b in id.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'/' => {
+                url.push(b as char);
+            }
+            _ => url.push_str(&format!("%{b:02X}")),
+        }
+    }
+    url
+}
+
+/// The note id inside a `note:` address, if `url` is one.
+pub fn note_id(url: &str) -> Option<String> {
+    let rest = url.trim().strip_prefix(NOTE_PREFIX)?;
+    if rest.is_empty() {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// A Markdown link whose visible text is the note's title and whose address
+/// opens that note.
+pub fn note_markdown(id: &str, title: &str) -> String {
+    let title = title.replace(['[', ']', '\n'], "");
+    let title = title.trim();
+    let title = if title.is_empty() {
+        crate::store::UNTITLED
+    } else {
+        title
+    };
+    format!("[{title}]({})", note_url(id))
+}
+
 /// A Markdown link for a pasted URL, labeled `text` or a readable label.
 pub fn markdown(url: &str, text: Option<&str>) -> String {
     let url = clean(url);
@@ -206,6 +259,25 @@ mod tests {
             "docs.example.com/…/advanced-setup"
         );
         assert!(label(&format!("https://a.io/{}", "x".repeat(80))).ends_with('…'));
+    }
+
+    #[test]
+    fn note_links_keep_the_title_and_round_trip_the_id() {
+        assert_eq!(
+            note_markdown("My Notes/grace", "Grace"),
+            "[Grace](note:My%20Notes/grace)"
+        );
+        assert_eq!(
+            note_id("note:My%20Notes/grace").as_deref(),
+            Some("My Notes/grace")
+        );
+        assert_eq!(
+            note_markdown("plans/study", "A [plan]"),
+            "[A plan](note:plans/study)"
+        );
+        assert_eq!(note_markdown("a", "  "), "[Untitled](note:a)");
+        assert_eq!(note_id("https://example.com"), None);
+        assert_eq!(note_id("note:"), None);
     }
 
     #[test]

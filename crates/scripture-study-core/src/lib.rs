@@ -12,13 +12,17 @@ pub mod folders;
 pub mod history;
 pub mod inline;
 pub mod links;
+pub mod marks;
 pub mod properties;
 pub mod scriptures;
 pub mod search;
 pub mod selection;
+pub mod settings;
+pub mod spell;
 pub mod store;
 mod time;
 
 pub use document::{Block, BlockKind, Document};
 pub use properties::Properties;
+pub use settings::{CollapsedOutline, NoteSettings};
 pub use store::{FsStore, NoteMeta, NoteStore};

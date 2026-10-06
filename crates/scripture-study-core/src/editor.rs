@@ -51,8 +51,19 @@ pub fn split_block(doc: &mut Document, index: usize, start: usize, end: usize) -
     } else {
         String::new()
     };
-    let tail = format!("{tabs}{}", block.text[end..].trim_start_matches('\t'));
-    block.text.truncate(start);
+    let original = block.text.clone();
+    let mut left = original[..start].to_string();
+    let tail = original[end..].trim_start_matches('\t').to_string();
+    let mut right = tail.clone();
+    // A code block shows its tags literally, so a split must not rewrite them.
+    if !matches!(block.kind, BlockKind::Code { .. }) {
+        crate::marks::repair_split(&original, start, end, &mut left, &mut right);
+    }
+    // Opening tags belong after the indent, and the caret belongs after those
+    // tags so typing continues inside the annotation.
+    let caret_byte = tabs.len() + right.len() - tail.len();
+    right = format!("{tabs}{right}");
+    block.text = left;
 
     let kind = match &block.kind {
         BlockKind::Todo { .. } => BlockKind::Todo { checked: false },
@@ -61,10 +72,10 @@ pub fn split_block(doc: &mut Document, index: usize, start: usize, end: usize) -
     };
     let indent = block.indent;
     doc.blocks
-        .insert(index + 1, Block::new(kind, tail).indented(indent));
+        .insert(index + 1, Block::new(kind, right).indented(indent));
     Caret {
         block: index + 1,
-        char: tabs.len(),
+        char: byte_to_char(&doc.blocks[index + 1].text, caret_byte),
     }
 }
 
@@ -194,7 +205,11 @@ pub fn delete_at_end(doc: &mut Document, index: usize) -> Option<Caret> {
 /// (`# `, `- `, `* `, `[] `, …), turns that line into its own block.
 /// Leading tabs become the block's indent. Returns where the caret goes.
 pub fn apply_markdown_shortcut(doc: &mut Document, index: usize, caret: usize) -> Option<Caret> {
-    if doc.blocks.get(index).is_none_or(|b| b.kind != BlockKind::Paragraph) {
+    if doc
+        .blocks
+        .get(index)
+        .is_none_or(|b| b.kind != BlockKind::Paragraph)
+    {
         return None;
     }
     let text = doc.blocks[index].text.clone();
@@ -812,7 +827,10 @@ mod tests {
 
         let mut d = doc(vec![Block::paragraph("\t+ child")]);
         assert!(apply_markdown_shortcut(&mut d, 0, 3).is_some());
-        assert_eq!(d.blocks[0], Block::new(BlockKind::Bullet, "child").indented(1));
+        assert_eq!(
+            d.blocks[0],
+            Block::new(BlockKind::Bullet, "child").indented(1)
+        );
 
         let mut d = doc(vec![Block::paragraph("Keep this\n* item\nand this")]);
         assert_eq!(

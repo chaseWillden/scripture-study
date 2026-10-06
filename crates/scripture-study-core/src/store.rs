@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::document::{BlockKind, Document};
+use crate::settings::{self, NoteSettings};
 use crate::time::civil_from_days;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,6 +128,18 @@ impl FsStore {
         self.dir(parent(id))
     }
 
+    /// Settings kept beside the note, in the folder's `.scripture-study` file.
+    pub fn note_settings(&self, id: &str) -> io::Result<NoteSettings> {
+        let _ = self.path(id)?;
+        settings::load_note(&self.note_dir(id)?, name(id))
+    }
+
+    /// Replaces the note's settings. Blank settings remove its entry.
+    pub fn set_note_settings(&self, id: &str, note_settings: &NoteSettings) -> io::Result<()> {
+        let _ = self.path(id)?;
+        settings::store_note(&self.note_dir(id)?, name(id), note_settings)
+    }
+
     /// Saves an image (or other file) for a note and returns the relative
     /// path to link it with, like `.assets/<note>-<time>.png`.
     pub fn save_asset(&self, id: &str, extension: &str, bytes: &[u8]) -> io::Result<String> {
@@ -150,10 +163,15 @@ impl FsStore {
             ));
         }
         let mut doc = self.load(id)?;
+        let from_dir = self.note_dir(id)?;
+        let stem = name(id).to_string();
         move_path(&source, &target)?;
-        if self.move_assets(&mut doc, &self.note_dir(id)?, dest)? {
+        if self.move_assets(&mut doc, &from_dir, dest)? {
             fs::write(&target, doc.to_markdown())?;
         }
+        // The settings file stays with the note. A failure here leaves the
+        // note moved; the entry is still in the old folder to retry.
+        settings::move_note(&from_dir, &stem, dest, &stem)?;
         Ok(target)
     }
 
@@ -332,7 +350,10 @@ impl NoteStore for FsStore {
     }
 
     fn delete(&self, id: &str) -> io::Result<()> {
-        fs::remove_file(self.path(id)?)
+        let dir = self.note_dir(id)?;
+        let stem = name(id).to_string();
+        fs::remove_file(self.path(id)?)?;
+        settings::store_note(&dir, &stem, &NoteSettings::default())
     }
 
     fn move_note(&self, id: &str, folder: &str) -> io::Result<String> {
@@ -347,12 +368,15 @@ impl NoteStore for FsStore {
             ));
         }
         let new_id = self.free_id(folder, name(id))?;
+        let from_dir = self.note_dir(id)?;
+        let from_stem = name(id).to_string();
         fs::rename(self.path(id)?, self.path(&new_id)?)?;
         // Images live next to the note, so they move with it.
         let mut doc = self.load(&new_id)?;
-        if self.move_assets(&mut doc, &self.note_dir(id)?, &dir)? {
+        if self.move_assets(&mut doc, &from_dir, &dir)? {
             self.save(&new_id, &doc)?;
         }
+        settings::move_note(&from_dir, &from_stem, &dir, name(&new_id))?;
         Ok(new_id)
     }
 
@@ -770,5 +794,78 @@ mod tests {
         let created = fs::metadata(&path).unwrap().created().unwrap();
         assert_eq!(created, past);
         assert_eq!(store.list().unwrap()[0].created, past);
+    }
+
+    #[test]
+    fn note_settings_live_beside_the_note_and_follow_it() {
+        use crate::settings::{CollapsedOutline, NoteSettings, FILE_NAME};
+
+        let (dir, store) = store();
+        let id = store.create().unwrap();
+        let other = store.create().unwrap();
+        let folded = NoteSettings {
+            collapsed: vec![CollapsedOutline {
+                key: "p:Parent".into(),
+                nth: 0,
+            }],
+        };
+        store.set_note_settings(&id, &folded).unwrap();
+        store
+            .set_note_settings(
+                &other,
+                &NoteSettings {
+                    collapsed: vec![CollapsedOutline {
+                        key: "p:Other".into(),
+                        nth: 1,
+                    }],
+                },
+            )
+            .unwrap();
+
+        let path = dir.path().join(FILE_NAME);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"version\": 1"));
+        assert!(text.contains("p:Parent"));
+        assert!(text.contains("p:Other"));
+        assert_eq!(store.note_settings(&id).unwrap(), folded);
+        // The settings file is not a note or a folder.
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert!(store.folders().unwrap().is_empty());
+
+        // Clearing the last entry removes the file. Clearing one keeps the other.
+        store
+            .set_note_settings(&id, &NoteSettings::default())
+            .unwrap();
+        assert!(path.exists());
+        assert!(store.note_settings(&id).unwrap().is_blank());
+        store
+            .set_note_settings(&other, &NoteSettings::default())
+            .unwrap();
+        assert!(!path.exists());
+
+        store.set_note_settings(&id, &folded).unwrap();
+        store.create_folder("Work").unwrap();
+        let moved = store.move_note(&id, "Work").unwrap();
+        assert_eq!(
+            store.note_settings(&moved).unwrap().collapsed[0].key,
+            "p:Parent"
+        );
+        assert!(!dir.path().join(FILE_NAME).exists());
+        assert!(dir.path().join("Work").join(FILE_NAME).exists());
+
+        store.delete(&moved).unwrap();
+        assert!(!dir.path().join("Work").join(FILE_NAME).exists());
+
+        // A file this version doesn't understand is left in place.
+        store.set_note_settings(&other, &folded).unwrap();
+        fs::write(
+            dir.path().join(FILE_NAME),
+            "{\"version\": 2, \"notes\": {}}",
+        )
+        .unwrap();
+        assert!(store.set_note_settings(&other, &folded).is_err());
+        assert!(fs::read_to_string(dir.path().join(FILE_NAME))
+            .unwrap()
+            .contains("\"version\": 2"));
     }
 }

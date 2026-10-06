@@ -258,6 +258,27 @@ pub fn plus(painter: &Painter, center: Pos2, color: Color32) {
     painter.line_segment([center - vec2(0.0, 4.5), center + vec2(0.0, 4.5)], stroke);
 }
 
+/// A marker pen ("highlight").
+pub fn highlight(painter: &Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(WIDTH, color);
+    let tip = center + vec2(-6.5, 5.0);
+    let end = center + vec2(5.5, -6.0);
+    painter.line_segment([tip, end], Stroke::new(3.2, color));
+    painter.line_segment([end, end + vec2(2.2, -2.2)], stroke);
+    painter.line_segment([tip + vec2(-1.2, 1.2), tip + vec2(2.4, 1.2)], stroke);
+}
+
+/// A line under a short stroke ("underline").
+pub fn underline(painter: &Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(WIDTH, color);
+    painter.hline(center.x - 5.5..=center.x + 5.5, center.y - 1.5, stroke);
+    painter.hline(
+        center.x - 6.5..=center.x + 6.5,
+        center.y + 4.0,
+        Stroke::new(1.8, color),
+    );
+}
+
 /// A small ×.
 pub fn close(painter: &Painter, center: Pos2, color: Color32) {
     let stroke = Stroke::new(WIDTH, color);

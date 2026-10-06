@@ -62,6 +62,7 @@ pub enum Choice {
     Edit,
     Remove,
     ConvertToCitation,
+    Mark(crate::marks::Choice),
 }
 
 pub struct LinkMenu {
@@ -80,7 +81,13 @@ impl LinkMenu {
     }
 
     /// Draws the menu. Returns the chosen item, and whether it stays open.
-    pub fn show(&mut self, ctx: &egui::Context, palette: &Palette) -> (Option<Choice>, bool) {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        palette: &Palette,
+        highlight: Option<u32>,
+        underline: Option<u32>,
+    ) -> (Option<Choice>, bool) {
         let bare = self.target.is_bare();
         let (choice, open) = menu::menu_at(
             ctx,
@@ -89,35 +96,44 @@ impl LinkMenu {
             palette,
             std::mem::take(&mut self.just_opened),
             |ui| {
-                if Item::new("Copy link address")
-                    .icon(icons::copy)
-                    .show(ui, palette)
-                {
-                    return Some(Choice::Copy);
-                }
-                if Item::new("Edit link").icon(icons::pencil).show(ui, palette) {
-                    return Some(Choice::Edit);
-                }
-                if Item::new("Convert to citation")
-                    .icon(icons::quote)
-                    .show(ui, palette)
-                {
-                    return Some(Choice::ConvertToCitation);
+                if let Some(choice) = items(ui, palette, bare) {
+                    return Some(choice);
                 }
                 menu::separator(ui, palette);
-                let remove = Item::new("Remove link")
-                    .icon(icons::unlink)
-                    .enabled(!bare)
-                    .disabled_hint("A web address typed out in full is always a link");
-                if remove.show(ui, palette) {
-                    return Some(Choice::Remove);
-                }
-                None
+                crate::marks::items(ui, palette, highlight, underline).map(Choice::Mark)
             },
         );
         let open = open && choice.is_none();
         (choice, open)
     }
+}
+
+/// The link actions, so a spelling menu can offer them too.
+pub(crate) fn items(ui: &mut Ui, palette: &Palette, bare: bool) -> Option<Choice> {
+    if Item::new("Copy link address")
+        .icon(icons::copy)
+        .show(ui, palette)
+    {
+        return Some(Choice::Copy);
+    }
+    if Item::new("Edit link").icon(icons::pencil).show(ui, palette) {
+        return Some(Choice::Edit);
+    }
+    if Item::new("Convert to citation")
+        .icon(icons::quote)
+        .show(ui, palette)
+    {
+        return Some(Choice::ConvertToCitation);
+    }
+    menu::separator(ui, palette);
+    let remove = Item::new("Remove link")
+        .icon(icons::unlink)
+        .enabled(!bare)
+        .disabled_hint("A web address typed out in full is always a link");
+    if remove.show(ui, palette) {
+        return Some(Choice::Remove);
+    }
+    None
 }
 
 pub enum FormOutcome {
@@ -143,8 +159,11 @@ impl LinkForm {
         } else {
             label
         };
+        let url = links::note_id(&target.url)
+            .map(|id| format!("note:{id}"))
+            .unwrap_or_else(|| target.url.clone());
         Self {
-            url: target.url.clone(),
+            url,
             text: label,
             target,
             focus: true,
@@ -156,6 +175,9 @@ impl LinkForm {
     fn result(&self) -> Option<String> {
         if self.url.trim().is_empty() {
             return Some(self.text.trim().to_string());
+        }
+        if let Some(id) = links::note_id(self.url.trim()) {
+            return Some(links::note_markdown(&id, self.text.trim()));
         }
         let url = links::as_url(&self.url)?;
         Some(links::markdown(&url, Some(self.text.as_str())))
@@ -187,14 +209,19 @@ impl LinkForm {
                 ui.add_space(2.0);
 
                 let focus = std::mem::take(&mut self.focus);
-                let hint = links::as_url(&self.url)
-                    .map(|url| links::label(&links::clean(&url)))
-                    .unwrap_or_default();
+                let note_link = links::note_id(self.url.trim()).is_some();
+                let hint = if note_link {
+                    String::new()
+                } else {
+                    links::as_url(&self.url)
+                        .map(|url| links::label(&links::clean(&url)))
+                        .unwrap_or_default()
+                };
                 field(ui, palette, "Text", &mut self.text, &hint, focus);
                 field(ui, palette, "Link", &mut self.url, "https://…", false);
                 let note = if self.url.trim().is_empty() {
                     "With no link, the text stays as plain text."
-                } else if links::as_url(&self.url).is_none() {
+                } else if !note_link && links::as_url(&self.url).is_none() {
                     "Enter a web address, starting with https://"
                 } else {
                     ""

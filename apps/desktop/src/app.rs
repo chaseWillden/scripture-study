@@ -8,6 +8,7 @@ use scripture_study_core::{
     commands::{self, Action, Command},
     folders::{self, Folder},
     search::IndexedNote,
+    settings::NoteSettings,
     store,
     store::UNTITLED,
     Document, FsStore, NoteMeta, NoteStore,
@@ -74,6 +75,11 @@ pub struct ScriptureStudyApp {
     error: Option<String>,
     /// Eased width of the page column. `0` until the first frame.
     page_width: f32,
+    /// When outline folds changed because the text did, not because of a click.
+    /// Written with the note, so a fold click doesn't wait for this.
+    outline_dirty_since: Option<f64>,
+    /// Misspellings, ignored words, and the user's dictionary.
+    spelling: crate::spell::Spelling,
 }
 
 impl ScriptureStudyApp {
@@ -104,9 +110,56 @@ impl ScriptureStudyApp {
             v_down: false,
             text_pasted: false,
             page_width: 0.0,
+            outline_dirty_since: None,
+            spelling: crate::spell::Spelling::new(),
         };
+        app.load_outline();
         app.refresh_notes();
         Ok(app)
+    }
+
+    /// Folds whatever `.scripture-study` recorded for the open note.
+    fn load_outline(&mut self) {
+        match self.store.note_settings(&self.current) {
+            Ok(settings) => self.editor.restore_collapsed(&settings.collapsed),
+            Err(e) => self.error = Some(format!("Couldn't read note settings: {e}")),
+        }
+    }
+
+    /// Writes folded outline items into the note's folder. A click is written
+    /// immediately; a change that came from editing waits out the autosave
+    /// delay, and saving or leaving the note flushes it.
+    fn persist_outline(&mut self, now: f64, ui: &egui::Ui) {
+        if self.editor.outline_needs_flush() {
+            self.flush_outline();
+            return;
+        }
+        if self.editor.outline_changes().is_none() {
+            self.outline_dirty_since = None;
+            return;
+        }
+        let since = *self.outline_dirty_since.get_or_insert(now);
+        let elapsed = now - since;
+        if elapsed >= SAVE_DELAY {
+            self.flush_outline();
+        } else {
+            ui.ctx()
+                .request_repaint_after_secs((SAVE_DELAY - elapsed) as f32);
+        }
+    }
+
+    fn flush_outline(&mut self) {
+        let Some(collapsed) = self.editor.outline_changes() else {
+            self.outline_dirty_since = None;
+            return;
+        };
+        let settings = NoteSettings { collapsed };
+        if let Err(e) = self.store.set_note_settings(&self.current, &settings) {
+            self.error = Some(format!("Couldn't save note settings: {e}"));
+            return;
+        }
+        self.editor.mark_outline_persisted();
+        self.outline_dirty_since = None;
     }
 
     fn refresh_notes(&mut self) {
@@ -149,6 +202,7 @@ impl ScriptureStudyApp {
         }
         self.error = None;
         self.refresh_notes();
+        self.flush_outline();
     }
 
     /// Saves the open note (or discards it if it's empty) and opens another.
@@ -160,6 +214,8 @@ impl ScriptureStudyApp {
                 let _ = self.store.delete(&self.current);
             } else if self.dirty_since.is_some() {
                 self.save();
+            } else {
+                self.flush_outline();
             }
         }
         match self.store.load(&id) {
@@ -168,6 +224,8 @@ impl ScriptureStudyApp {
                 self.sidebar.reveal(store::parent(&id));
                 self.scriptures.close();
                 self.current = id;
+                self.outline_dirty_since = None;
+                self.load_outline();
             }
             Err(e) => self.error = Some(format!("Couldn't open note: {e}")),
         }
@@ -183,7 +241,10 @@ impl ScriptureStudyApp {
             Action::OpenNote(id) => self.open(id),
             Action::DeleteNote => self.delete(self.current.clone()),
             // The editor handles these itself.
-            Action::SetBlock(_) | Action::InsertCitation | Action::InsertScripture => {}
+            Action::SetBlock(_)
+            | Action::InsertCitation
+            | Action::InsertScripture
+            | Action::InsertFileLink => {}
         }
     }
 
@@ -282,10 +343,14 @@ impl ScriptureStudyApp {
             self.sidebar.start_search();
             self.scriptures.close();
         }
-        // Cmd+F finds within the open note; Cmd+K searches every note.
-        // The scriptures page has no find bar, so the shortcut waits.
-        if !self.scriptures.is_open() && ui.input_mut(|i| i.consume_shortcut(&FIND)) {
-            self.editor.find.open();
+        // Cmd+F finds within the open note, or the open chapter on the
+        // scriptures page. Cmd+K searches every note.
+        if ui.input_mut(|i| i.consume_shortcut(&FIND)) {
+            if self.scriptures.is_open() {
+                self.scriptures.open_find();
+            } else {
+                self.editor.find.open();
+            }
         }
         // On macOS the menu bar takes ⌘O and reports it here.
         let open_folder =
@@ -456,6 +521,8 @@ impl ScriptureStudyApp {
             let _ = self.store.delete(&self.current);
         } else if self.dirty_since.is_some() {
             self.save();
+        } else {
+            self.flush_outline();
         }
     }
 
@@ -490,6 +557,8 @@ impl ScriptureStudyApp {
         self.editor = Editor::new(&current, doc);
         self.current = current;
         self.dirty_since = None;
+        self.outline_dirty_since = None;
+        self.load_outline();
         self.sidebar.forget_notes();
         self.error = (self.remember_library)(&dir)
             .err()
@@ -507,6 +576,8 @@ impl ScriptureStudyApp {
         // Flush pending edits so the file being moved is current.
         if takes_current && self.dirty_since.is_some() {
             self.save();
+        } else if takes_current {
+            self.flush_outline();
         }
         let start = self.store.root().parent().unwrap_or(self.store.root());
         let Some(dest) = (self.pick_folder)("Move to", start) else {
@@ -530,6 +601,8 @@ impl ScriptureStudyApp {
         // Flush pending edits so the file being moved is current.
         if id == self.current && self.dirty_since.is_some() {
             self.save();
+        } else if id == self.current {
+            self.flush_outline();
         }
         let new_id = self.store.move_note(id, folder)?;
         if id == self.current {
@@ -552,6 +625,8 @@ impl ScriptureStudyApp {
             ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
                 self.scriptures.show_reading(ui, palette, index_open);
             });
+            let top_right = pos2(full.right() - 16.0, full.top() + TITLEBAR_HEIGHT + 4.0);
+            self.scriptures.show_find_bar(ui.ctx(), top_right, palette);
         });
     }
 
@@ -561,7 +636,7 @@ impl ScriptureStudyApp {
             .note_dir(&self.current)
             .unwrap_or_else(|_| self.store.root().to_path_buf());
         let times = self.note_times();
-        egui::CentralPanel::no_frame()
+        let events = egui::CentralPanel::no_frame()
             .show(ui, |ui| {
                 ui.painter()
                     .rect_filled(ui.max_rect(), 0.0, palette.background);
@@ -573,7 +648,14 @@ impl ScriptureStudyApp {
                         let full = ui.available_rect_before_wrap();
                         let column = self.page_column(ui, full);
                         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
-                            self.editor.show(ui, &self.commands, times, &dir)
+                            self.editor.show(
+                                ui,
+                                &self.commands,
+                                &self.notes,
+                                times,
+                                &dir,
+                                &mut self.spelling,
+                            )
                         })
                         .inner
                     })
@@ -582,7 +664,11 @@ impl ScriptureStudyApp {
                 self.editor.show_find_bar(ui.ctx(), top_right, palette);
                 events
             })
-            .inner
+            .inner;
+        if let Some(message) = self.spelling.take_error() {
+            self.error = Some(message);
+        }
+        events
     }
 
     /// Page column for `area`. The left edge stays put; the width eases toward
@@ -802,6 +888,11 @@ impl eframe::App for ScriptureStudyApp {
                     self.dirty_since.get_or_insert(now);
                     self.run(action);
                 }
+                Event::OpenNote(id) => {
+                    if id != self.current {
+                        self.open(id);
+                    }
+                }
             }
         }
 
@@ -814,6 +905,7 @@ impl eframe::App for ScriptureStudyApp {
                     .request_repaint_after_secs((SAVE_DELAY - elapsed) as f32);
             }
         }
+        self.persist_outline(now, ui);
 
         if let Some(error) = &self.error {
             egui::Area::new(egui::Id::new("error"))

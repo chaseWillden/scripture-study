@@ -2,8 +2,8 @@
 //! every match highlighted and the current one scrolled into view.
 
 use eframe::egui::{
-    self, pos2, vec2, Color32, CornerRadius, FontId, Frame, Id, Key, Margin, Modifiers, Order,
-    Pos2, Rect, RichText, Sense, Shadow, Stroke, TextEdit, Ui,
+    self, pos2, vec2, Color32, CornerRadius, FontId, Frame, Galley, Id, Key, Margin, Modifiers,
+    Order, Pos2, Rect, RichText, Sense, Shadow, Shape, Stroke, TextEdit, Ui,
 };
 use scripture_study_core::find::{self, Match};
 use scripture_study_core::Document;
@@ -13,6 +13,11 @@ use crate::theme::Palette;
 
 const WIDTH: f32 = 380.0;
 const BUTTON: f32 = 24.0;
+
+/// Placeholder for the note find bar.
+pub const NOTE_HINT: &str = "Find in note";
+/// Placeholder for the chapter find bar.
+pub const CHAPTER_HINT: &str = "Find in chapter";
 
 #[derive(Default)]
 pub struct FindBar {
@@ -60,12 +65,26 @@ impl FindBar {
 
     /// Re-runs the search against the note as it is now.
     pub fn update(&mut self, doc: &Document) {
+        self.set_matches(find::find(doc, &self.query, self.fuzzy));
+    }
+
+    /// Re-runs the search against plain strings (a chapter's verses).
+    pub fn update_plain(&mut self, texts: &[&str]) {
+        self.set_matches(find::find_plain(texts, &self.query, self.fuzzy));
+    }
+
+    fn set_matches(&mut self, matches: Vec<Match>) {
         if !self.open {
             self.matches.clear();
             return;
         }
-        self.matches = find::find(doc, &self.query, self.fuzzy);
+        self.matches = matches;
         self.current = self.current.min(self.matches.len().saturating_sub(1));
+    }
+
+    /// The query field has focus, so Escape belongs to the bar.
+    pub fn query_focused(&self, ctx: &egui::Context) -> bool {
+        self.open && ctx.memory(|m| m.has_focus(Id::new("find-query")))
     }
 
     fn step(&mut self, forward: bool) {
@@ -80,13 +99,15 @@ impl FindBar {
         }
     }
 
-    /// Draws the bar with its right edge at `top_right`. Returns the match to
-    /// select in the note when the bar closes with one highlighted.
+    /// Draws the bar with its right edge at `top_right`. `hint` is the empty
+    /// field's placeholder ("Find in note", "Find in chapter"). Returns the
+    /// match to select when the bar closes with one highlighted.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
         top_right: Pos2,
         palette: &Palette,
+        hint: &str,
     ) -> Option<Match> {
         if !self.open {
             return None;
@@ -111,7 +132,7 @@ impl FindBar {
                         ui.set_width(WIDTH - 16.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            close = self.contents(ui, palette);
+                            close = self.contents(ui, palette, hint);
                         });
                     });
             });
@@ -125,7 +146,7 @@ impl FindBar {
     }
 
     /// The field, count, and buttons. Returns true to close.
-    fn contents(&mut self, ui: &mut Ui, palette: &Palette) -> bool {
+    fn contents(&mut self, ui: &mut Ui, palette: &Palette, hint: &str) -> bool {
         let id = Id::new("find-query");
         let (icon, _) = ui.allocate_exact_size(vec2(18.0, BUTTON), Sense::hover());
         icons::search(ui.painter(), icon.center(), palette.faint);
@@ -155,11 +176,7 @@ impl FindBar {
             .desired_width(170.0)
             .font(FontId::proportional(13.5))
             .text_color(palette.text)
-            .hint_text(
-                RichText::new("Find in note")
-                    .size(13.5)
-                    .color(palette.subtle),
-            )
+            .hint_text(RichText::new(hint).size(13.5).color(palette.subtle))
             .return_key(None)
             .event_filter(egui::EventFilter {
                 escape: true,
@@ -167,9 +184,9 @@ impl FindBar {
                 ..Default::default()
             })
             .show(ui);
-        output.response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Find in note")
-        });
+        output
+            .response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, hint));
         if output.response.changed() {
             self.current = 0;
             self.reveal = true;
@@ -301,6 +318,41 @@ fn arrow(painter: &egui::Painter, center: Pos2, color: Color32, up: bool) {
         ],
         Stroke::new(1.4, color),
     );
+}
+
+/// Highlight rectangles for characters `from..to` of a laid-out galley.
+/// `continues` marks a selection running past the end, drawn as a sliver
+/// after the last character (like a selected line break).
+pub fn highlight_shapes(
+    galley: &Galley,
+    origin: Pos2,
+    from: usize,
+    to: usize,
+    continues: bool,
+    color: Color32,
+) -> Vec<Shape> {
+    let mut shapes = Vec::new();
+    let mut row_start = 0;
+    let rows = galley.rows.len();
+    for (n, row) in galley.rows.iter().enumerate() {
+        let row_end = row_start + row.char_count_excluding_newline().0;
+        let past_end = (to > row_end && row.ends_with_newline) || (continues && n + 1 == rows);
+        if from <= row_end && to >= row_start && (to > from || past_end) {
+            let (lo, hi) = (from.max(row_start), to.min(row_end));
+            let x0 = row.pos.x + row.x_offset((lo - row_start).into());
+            let sliver = if past_end { 6.0 } else { 0.0 };
+            let x1 = row.pos.x + row.x_offset((hi - row_start).into()) + sliver;
+            if x1 > x0 {
+                let rect = Rect::from_x_y_ranges(
+                    origin.x + x0..=origin.x + x1,
+                    origin.y + row.min_y()..=origin.y + row.max_y(),
+                );
+                shapes.push(Shape::rect_filled(rect, 0.0, color));
+            }
+        }
+        row_start += row.char_count_including_newline().0;
+    }
+    shapes
 }
 
 /// The on-screen rectangle of characters `start..end` on their first line, for

@@ -1,17 +1,17 @@
 //! Latter-day Saint scriptures, bundled from `data/lds-scriptures.json`.
 //!
-//! [`search`] fuzzy-matches a reference (`Ether 2:1-4`, `1 Nephi 1:11`, `D&C 4:1`)
-//! or words from the verse. A hit's [`Hit::label`] is what a citation shows
-//! in place of a number.
+//! [`search`] fuzzy-matches a reference (`Ether 2:1-4`, `1 Nephi 1:11`,
+//! `1 Nephi 1:1,3`, `D&C 4:1`) or words from the verse. A hit's [`Hit::label`]
+//! is what a citation shows in place of a number.
 
 use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-/// One passage a person can cite: a verse, or a verse range in one chapter.
+/// One passage a person can cite: a verse, a range, or several verses in one chapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hit {
-    /// Superscript text, e.g. `1 Nephi 1:11` or `Ether 2:1-4`.
+    /// Superscript text, e.g. `1 Nephi 1:11`, `Ether 2:1-4`, or `1 Nephi 1:1,3`.
     pub label: String,
     /// Footnote body: the verse text, then the volume.
     pub text: String,
@@ -58,7 +58,11 @@ struct Catalog {
 enum Spec {
     Book,
     Chapter(u16),
-    Verses { chapter: u16, start: u16, end: u16 },
+    /// Inclusive verse spans in one chapter. A single verse is `(n, n)`.
+    Verses {
+        chapter: u16,
+        spans: Vec<(u16, u16)>,
+    },
     Rejected,
 }
 
@@ -136,16 +140,15 @@ impl Catalog {
                     }
                 }
             }
-            Spec::Verses {
-                chapter,
-                start,
-                end,
-            } => {
-                if end > start {
-                    self.push_range(hits, book, chapter, start, end);
-                }
-                let mut numbers: Vec<u16> = (start..=end).collect();
-                if start == end {
+            Spec::Verses { chapter, spans } => {
+                self.push_passage(hits, book, chapter, &spans);
+                let mut numbers: Vec<u16> = self
+                    .found_verses(book, chapter, &spans)
+                    .into_iter()
+                    .map(|(number, _)| number)
+                    .collect();
+                if spans.len() == 1 && spans[0].0 == spans[0].1 {
+                    let start = spans[0].0;
                     let before = start.saturating_sub(2);
                     numbers.extend(before..start);
                     numbers.extend(start + 1..=start.saturating_add(6));
@@ -157,22 +160,48 @@ impl Catalog {
         }
     }
 
-    fn push_range(&self, hits: &mut Vec<Hit>, book: usize, chapter: u16, start: u16, end: u16) {
-        let mut indexes = Vec::new();
-        for number in start..=end {
-            let Some(index) = self.find_verse(book, chapter, number) else {
-                break;
-            };
-            indexes.push(index);
-            if indexes.len() >= 80 {
+    /// One citation for every verse the spans name, when that is more than one verse.
+    fn push_passage(&self, hits: &mut Vec<Hit>, book: usize, chapter: u16, spans: &[(u16, u16)]) {
+        let found = self.found_verses(book, chapter, spans);
+        if found.len() < 2 {
+            return;
+        }
+        let numbers: Vec<u16> = found.iter().map(|(number, _)| *number).collect();
+        let indexes: Vec<usize> = found.iter().map(|(_, index)| *index).collect();
+        let label = format!(
+            "{} {chapter}:{}",
+            self.books[book].title,
+            format_verse_list(&numbers)
+        );
+        if hits.iter().any(|hit| hit.label == label) {
+            return;
+        }
+        hits.push(self.hit_labeled(book, &label, &indexes));
+    }
+
+    /// Verses the spans name, in verse order. A span stops at the first missing verse.
+    fn found_verses(&self, book: usize, chapter: u16, spans: &[(u16, u16)]) -> Vec<(u16, usize)> {
+        let mut found = Vec::new();
+        for &(start, end) in spans {
+            if end < start {
+                continue;
+            }
+            for number in start..=end {
+                let Some(index) = self.find_verse(book, chapter, number) else {
+                    break;
+                };
+                found.push((number, index));
+                if found.len() >= 80 {
+                    break;
+                }
+            }
+            if found.len() >= 80 {
                 break;
             }
         }
-        if indexes.len() < 2 {
-            return;
-        }
-        let end = self.verses[*indexes.last().expect("verse")].number;
-        hits.push(self.hit(book, chapter, start, end, &indexes));
+        found.sort_by_key(|(number, _)| *number);
+        found.dedup_by_key(|(number, _)| *number);
+        found
     }
 
     fn push_verse(&self, hits: &mut Vec<Hit>, book: usize, chapter: u16, number: u16) {
@@ -187,8 +216,12 @@ impl Catalog {
     }
 
     fn hit(&self, book: usize, chapter: u16, start: u16, end: u16, indexes: &[usize]) -> Hit {
+        let label = verse_label(&self.books[book].title, chapter, start, end);
+        self.hit_labeled(book, &label, indexes)
+    }
+
+    fn hit_labeled(&self, book: usize, label: &str, indexes: &[usize]) -> Hit {
         let book = &self.books[book];
-        let label = verse_label(&book.title, chapter, start, end);
         let body = if indexes.len() == 1 {
             self.verses[indexes[0]].text.clone()
         } else {
@@ -203,7 +236,7 @@ impl Catalog {
         };
         let preview = preview(&self.verses[indexes[0]].text);
         Hit {
-            label,
+            label: label.to_string(),
             text: format!("{body} — *{}*", book.volume),
             preview,
         }
@@ -363,6 +396,28 @@ fn verse_label(book: &str, chapter: u16, start: u16, end: u16) -> String {
     } else {
         format!("{book} {chapter}:{start}-{end}")
     }
+}
+
+/// `1`, `1-3`, or `1,3` from verse numbers already sorted and unique.
+/// Neighbors become one range: `1,2,3` is `1-3`.
+fn format_verse_list(numbers: &[u16]) -> String {
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < numbers.len() {
+        let start = numbers[i];
+        let mut end = start;
+        while i + 1 < numbers.len() && numbers[i + 1] == end + 1 {
+            i += 1;
+            end = numbers[i];
+        }
+        if start == end {
+            parts.push(start.to_string());
+        } else {
+            parts.push(format!("{start}-{end}"));
+        }
+        i += 1;
+    }
+    parts.join(",")
 }
 
 fn preview(text: &str) -> String {
@@ -551,41 +606,54 @@ fn parse_spec(rest: &str) -> Spec {
     } else if !rest.as_bytes()[i].is_ascii_digit() {
         return Spec::Rejected;
     }
-    let Some(start) = take_number(rest, &mut i) else {
+    let Some(spans) = parse_spans(rest, &mut i) else {
         return Spec::Rejected;
     };
-    skip_ws(rest, &mut i);
-    if i >= rest.len() {
-        return Spec::Verses {
-            chapter,
-            start,
-            end: start,
-        };
+    if spans.is_empty() {
+        return Spec::Chapter(chapter);
     }
-    let dash = rest[i..].chars().next();
-    if matches!(dash, Some('-' | '–' | '—')) {
-        i += dash.expect("dash").len_utf8();
-        skip_ws(rest, &mut i);
-        if i >= rest.len() {
-            return Spec::Verses {
-                chapter,
-                start,
-                end: start,
-            };
-        }
-        let Some(end) = take_number(rest, &mut i) else {
-            return Spec::Rejected;
+    Spec::Verses { chapter, spans }
+}
+
+/// `1`, `1-2`, `1,3`, and `1-2,5`. A trailing comma or dash is the verse so far.
+fn parse_spans(rest: &str, i: &mut usize) -> Option<Vec<(u16, u16)>> {
+    let mut spans = Vec::new();
+    loop {
+        skip_ws(rest, i);
+        let Some(start) = take_number(rest, i) else {
+            return None;
         };
-        skip_ws(rest, &mut i);
-        if i == rest.len() && end >= start {
-            return Spec::Verses {
-                chapter,
-                start,
-                end,
-            };
+        skip_ws(rest, i);
+        let end = if *i < rest.len() && rest.as_bytes()[*i] == b'-' {
+            *i += 1;
+            skip_ws(rest, i);
+            if *i >= rest.len() || !rest.as_bytes()[*i].is_ascii_digit() {
+                start
+            } else {
+                let end = take_number(rest, i)?;
+                if end < start {
+                    return None;
+                }
+                end
+            }
+        } else {
+            start
+        };
+        spans.push((start, end));
+        skip_ws(rest, i);
+        if *i >= rest.len() {
+            return Some(spans);
         }
+        if rest.as_bytes()[*i] == b',' {
+            *i += 1;
+            skip_ws(rest, i);
+            if *i >= rest.len() {
+                return Some(spans);
+            }
+            continue;
+        }
+        return None;
     }
-    Spec::Rejected
 }
 
 fn take_number(text: &str, i: &mut usize) -> Option<u16> {
@@ -651,10 +719,15 @@ pub fn find_verses(query: &str) -> Vec<VerseHit> {
         .collect()
 }
 
-/// `Genesis 1:1` or `Ether 2:1-4` into book, chapter, and the first verse.
+/// `Genesis 1:1`, `Ether 2:1-4`, or `1 Nephi 1:1,3` into book, chapter, and the first verse.
 fn locate(label: &str) -> Option<(String, u16, u16)> {
     let (head, verses) = label.rsplit_once(':')?;
-    let number: u16 = verses.split(['-', '–', '—']).next()?.trim().parse().ok()?;
+    let number: u16 = verses
+        .split([',', '-', '–', '—'])
+        .next()?
+        .trim()
+        .parse()
+        .ok()?;
     let (book, chapter) = head.rsplit_once(' ')?;
     let chapter: u16 = chapter.parse().ok()?;
     if book.is_empty() {
@@ -809,6 +882,41 @@ mod tests {
         assert!(ether.text.contains("Jared"), "{}", ether.text);
         assert!(ether.text.contains("Nimrod"), "{}", ether.text);
         assert!(ether.text.starts_with("1 And it came"), "{}", ether.text);
+
+        let listed = &search("1 Nephi 1:1,3")[0];
+        assert_eq!(listed.label, "1 Nephi 1:1,3");
+        assert!(
+            listed.text.contains("I, Nephi, having been born"),
+            "{}",
+            listed.text
+        );
+        assert!(
+            listed.text.contains("the record which I make is true"),
+            "{}",
+            listed.text
+        );
+        assert!(
+            !listed.text.contains("language of my father"),
+            "{}",
+            listed.text
+        );
+
+        let spaced = &search("1 nephi 1:1, 3")[0];
+        assert_eq!(spaced.label, "1 Nephi 1:1,3");
+        assert_eq!(search("1 Nephi 1:1,2")[0].label, "1 Nephi 1:1-2");
+        assert_eq!(search("1 Nephi 1:1,")[0].label, "1 Nephi 1:1");
+
+        let mixed = &search("ether 2:1-2,5")[0];
+        assert_eq!(mixed.label, "Ether 2:1-2,5");
+        assert!(mixed.text.contains("Jared"), "{}", mixed.text);
+        assert!(mixed.text.contains("fowls"), "{}", mixed.text);
+        assert!(mixed.text.contains("the Lord commanded"), "{}", mixed.text);
+        assert!(!mixed.text.contains("deseret"), "{}", mixed.text);
+        assert!(
+            !mixed.text.contains("when they had come down"),
+            "{}",
+            mixed.text
+        );
     }
 
     #[test]

@@ -17,14 +17,8 @@ pub struct Match {
 /// matching also tolerates small typos: about one wrong, missing, or extra
 /// character per four typed.
 pub fn find(doc: &Document, query: &str, fuzzy: bool) -> Vec<Match> {
-    let pattern: Vec<char> = query.trim().chars().map(fold).collect();
-    if pattern.is_empty() {
+    let Some((pattern, errors)) = pattern_of(query, fuzzy) else {
         return Vec::new();
-    }
-    let errors = if fuzzy {
-        allowed_errors(pattern.len())
-    } else {
-        0
     };
     let mut out = Vec::new();
     for (index, block) in doc.blocks.iter().enumerate() {
@@ -38,6 +32,39 @@ pub fn find(doc: &Document, query: &str, fuzzy: bool) -> Vec<Match> {
         }
     }
     out
+}
+
+/// Every match of `query` in plain strings, in order. [`Match::block`] is the
+/// string's index and the range is in characters. Same rules as [`find`].
+pub fn find_plain(texts: &[&str], query: &str, fuzzy: bool) -> Vec<Match> {
+    let Some((pattern, errors)) = pattern_of(query, fuzzy) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (index, text) in texts.iter().enumerate() {
+        let chars: Vec<char> = text.chars().map(fold).collect();
+        for (start, end) in matches(&chars, &pattern, errors) {
+            out.push(Match {
+                block: index,
+                start,
+                end,
+            });
+        }
+    }
+    out
+}
+
+fn pattern_of(query: &str, fuzzy: bool) -> Option<(Vec<char>, usize)> {
+    let pattern: Vec<char> = query.trim().chars().map(fold).collect();
+    if pattern.is_empty() {
+        return None;
+    }
+    let errors = if fuzzy {
+        allowed_errors(pattern.len())
+    } else {
+        0
+    };
+    Some((pattern, errors))
 }
 
 /// Typos allowed for a query of `len` characters. Very short queries stay
@@ -225,6 +252,27 @@ mod tests {
         assert_eq!(allowed_errors(4), 1);
         assert_eq!(allowed_errors(9), 2);
         assert!(find(&doc(), "thx", true).is_empty());
+    }
+
+    #[test]
+    fn plain_text_matches_like_a_note() {
+        let texts = ["In the beginning God created the heaven and the earth."];
+        assert!(find_plain(&texts, "begining", false).is_empty());
+        assert_eq!(
+            find_plain(&texts, "begining", true)
+                .iter()
+                .map(|m| (m.block, m.start, m.end))
+                .collect::<Vec<_>>(),
+            [(0, 7, 16)]
+        );
+        let repeated = ["aa aa"];
+        assert_eq!(
+            find_plain(&repeated, "aa", false)
+                .iter()
+                .map(|m| (m.start, m.end))
+                .collect::<Vec<_>>(),
+            [(0, 2), (3, 5)]
+        );
     }
 
     #[test]

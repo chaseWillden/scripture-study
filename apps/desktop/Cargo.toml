@@ -23,6 +23,9 @@ rfd = "0.17"
 egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
 tempfile = "3"
 
-# The macOS menu bar.
+# The macOS menu bar and the system spelling dictionary.
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.17"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSArray"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSSpellChecker"] }

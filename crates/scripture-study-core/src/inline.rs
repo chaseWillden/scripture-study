@@ -1,5 +1,9 @@
 //! Inline Markdown: `**bold**`, `*italic*` / `_italic_`, `` `code` ``, `~~strike~~`,
-//! `[links](https://…)`, and bare `https://…` URLs.
+//! `[links](https://…)`, bare `https://…` URLs, and annotations.
+//!
+//! A highlight is `<mark #FFE08A>text</mark>` and an underline is
+//! `<u #9EC7F5>text</u>`. The color is six hex digits. The tags are markup,
+//! so they stay in the file and disappear on screen.
 //!
 //! [`parse`] splits text into styled spans that cover every byte of the input,
 //! so a renderer can lay the raw text out with rich styling while the text
@@ -16,6 +20,83 @@ pub struct Style {
     pub link: bool,
     /// A citation reference's number (`[^1]`), shown raised.
     pub footnote: bool,
+    /// Highlight behind the text, as `0xRRGGBB`.
+    pub highlight: Option<u32>,
+    /// Underline color, as `0xRRGGBB`.
+    pub underline: Option<u32>,
+}
+
+/// Swatches for highlights and underlines, in menu order.
+pub const MARK_COLORS: &[(&str, u32)] = &[
+    ("Yellow", 0xFFE08A),
+    ("Green", 0x8ED6A8),
+    ("Blue", 0x9EC7F5),
+    ("Pink", 0xF5B3CE),
+    ("Orange", 0xF6C59A),
+    ("Purple", 0xC9B6F5),
+];
+
+/// Highlight applied by the keyboard shortcut.
+pub const DEFAULT_HIGHLIGHT: u32 = 0xFFE08A;
+/// Underline applied by the keyboard shortcut.
+pub const DEFAULT_UNDERLINE: u32 = 0x9EC7F5;
+
+/// `0xRRGGBB` as bytes.
+pub fn color_rgb(color: u32) -> (u8, u8, u8) {
+    (
+        ((color >> 16) & 0xFF) as u8,
+        ((color >> 8) & 0xFF) as u8,
+        (color & 0xFF) as u8,
+    )
+}
+
+/// Highlight or underline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkKind {
+    Highlight,
+    Underline,
+}
+
+impl MarkKind {
+    /// The opening tag, with `color` written as six uppercase hex digits.
+    pub fn open_tag(self, color: u32) -> String {
+        match self {
+            MarkKind::Highlight => format!("<mark #{color:06X}>"),
+            MarkKind::Underline => format!("<u #{color:06X}>"),
+        }
+    }
+
+    pub fn close_tag(self) -> &'static str {
+        match self {
+            MarkKind::Highlight => "</mark>",
+            MarkKind::Underline => "</u>",
+        }
+    }
+
+    fn open_prefix(self) -> &'static str {
+        match self {
+            MarkKind::Highlight => "<mark #",
+            MarkKind::Underline => "<u #",
+        }
+    }
+
+    pub fn color_of(self, style: Style) -> Option<u32> {
+        match self {
+            MarkKind::Highlight => style.highlight,
+            MarkKind::Underline => style.underline,
+        }
+    }
+}
+
+/// One highlight or underline in `text`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mark {
+    pub kind: MarkKind,
+    pub color: u32,
+    /// The annotated text, not the tags.
+    pub content: Range<usize>,
+    /// Tags included.
+    pub full: Range<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,8 +157,146 @@ pub fn hidden_pairs(text: &str) -> Vec<[Range<usize>; 2]> {
             [r.range.start..label.start, label.end..r.range.end]
         }))
         .collect();
+    for mark in marks(text) {
+        pairs.push([
+            mark.full.start..mark.content.start,
+            mark.content.end..mark.full.end,
+        ]);
+    }
     pairs.sort_by_key(|[open, _]| open.start);
     pairs
+}
+
+/// Every highlight and underline in `text`, outer marks before the ones
+/// inside them. Tags inside inline code are left as code.
+pub fn marks(text: &str) -> Vec<Mark> {
+    let mut out = Vec::new();
+    scan_marks(text, 0, text.len(), &mut out);
+    out
+}
+
+fn scan_marks(text: &str, start: usize, end: usize, out: &mut Vec<Mark>) {
+    let mut i = start;
+    while i < end {
+        if let Some(code_end) = code_span_end(text, i, end) {
+            i = code_end;
+            continue;
+        }
+        if let Some(found) = match_mark(text, i, end) {
+            out.push(Mark {
+                kind: found.kind,
+                color: found.color,
+                content: found.content.clone(),
+                full: i..found.end,
+            });
+            scan_marks(text, found.content.start, found.content.end, out);
+            i = found.end;
+            continue;
+        }
+        i += text[i..].chars().next().map_or(1, char::len_utf8);
+    }
+}
+
+struct MarkMatch {
+    kind: MarkKind,
+    color: u32,
+    content: Range<usize>,
+    end: usize,
+}
+
+/// A `<mark #RRGGBB>…</mark>` or `<u #RRGGBB>…</u>` starting at `i`.
+fn match_mark(text: &str, i: usize, end: usize) -> Option<MarkMatch> {
+    let kind = mark_kind_at(text, i, end)?;
+    let color_at = i + kind.open_prefix().len();
+    let gt = color_at + 6;
+    if gt >= end || text.as_bytes().get(gt) != Some(&b'>') {
+        return None;
+    }
+    let color = parse_hex(&text[color_at..gt])?;
+    let content_start = gt + 1;
+    let close_at = find_mark_close(text, content_start, end, kind)?;
+    let content_end = content_start + close_at;
+    if content_start == content_end {
+        return None;
+    }
+    Some(MarkMatch {
+        kind,
+        color,
+        content: content_start..content_end,
+        end: content_end + kind.close_tag().len(),
+    })
+}
+
+fn mark_kind_at(text: &str, i: usize, end: usize) -> Option<MarkKind> {
+    let rest = text.get(i..end)?;
+    if rest.starts_with(MarkKind::Highlight.open_prefix()) {
+        Some(MarkKind::Highlight)
+    } else if rest.starts_with(MarkKind::Underline.open_prefix()) {
+        Some(MarkKind::Underline)
+    } else {
+        None
+    }
+}
+
+fn parse_hex(s: &str) -> Option<u32> {
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(s, 16).ok()
+}
+
+/// Byte offset from `from` of the close tag matching the open tag that
+/// consumed everything before `from`. Nested tags of the same kind count.
+fn find_mark_close(text: &str, from: usize, end: usize, kind: MarkKind) -> Option<usize> {
+    let close = kind.close_tag();
+    let mut i = from;
+    let mut depth = 1;
+    while i < end {
+        if let Some(code_end) = code_span_end(text, i, end) {
+            i = code_end;
+            continue;
+        }
+        if let Some(tag_end) = open_tag_end(text, i, end, kind) {
+            depth += 1;
+            i = tag_end;
+            continue;
+        }
+        if text[i..end].starts_with(close) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i - from);
+            }
+            i += close.len();
+            continue;
+        }
+        i += text[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+/// Index just after an opening tag of `kind` at `i`.
+fn open_tag_end(text: &str, i: usize, end: usize, kind: MarkKind) -> Option<usize> {
+    let prefix = kind.open_prefix();
+    if text.get(i..end)?.starts_with(prefix) {
+        let color_at = i + prefix.len();
+        let gt = color_at + 6;
+        if gt < end
+            && text.as_bytes().get(gt) == Some(&b'>')
+            && parse_hex(&text[color_at..gt]).is_some()
+        {
+            return Some(gt + 1);
+        }
+    }
+    None
+}
+
+/// End of a `` `code` `` span starting at `i`, if the backtick has a closer.
+fn code_span_end(text: &str, i: usize, end: usize) -> Option<usize> {
+    if !text.get(i..end)?.starts_with('`') {
+        return None;
+    }
+    let close = text[i + 1..end].find('`')?;
+    (close > 0).then_some(i + 1 + close + 1)
 }
 
 /// Every link in `text`, in order.
@@ -211,6 +430,27 @@ fn parse_range(text: &str, range: Range<usize>, style: Style, out: &mut Vec<Span
     let mut i = range.start;
 
     while i < range.end {
+        if !style.code {
+            if let Some(found) = match_mark(text, i, range.end) {
+                push(out, plain_start..i, style, false);
+                push(out, i..found.content.start, style, true);
+                let inner = match found.kind {
+                    MarkKind::Highlight => Style {
+                        highlight: Some(found.color),
+                        ..style
+                    },
+                    MarkKind::Underline => Style {
+                        underline: Some(found.color),
+                        ..style
+                    },
+                };
+                parse_range(text, found.content.clone(), inner, out);
+                push(out, found.content.end..found.end, style, true);
+                i = found.end;
+                plain_start = i;
+                continue;
+            }
+        }
         if !style.code && !style.link {
             if let Some(r) = crate::citations::match_ref(text, i, range.end) {
                 push(out, plain_start..i, style, false);
@@ -374,6 +614,8 @@ mod tests {
         strike: false,
         link: false,
         footnote: false,
+        highlight: None,
+        underline: None,
     };
     const BOLD: Style = Style {
         bold: true,
@@ -511,5 +753,76 @@ mod tests {
     #[test]
     fn plain_text_strips_markers() {
         assert_eq!(plain_text("My **big** `idea`"), "My big idea");
+    }
+
+    #[test]
+    fn highlights_and_underlines_carry_their_color() {
+        let text = "see <mark #FFE08A>this **word**</mark> and <u #9ec7f5>that</u>";
+        let highlight = Style {
+            highlight: Some(0xFFE08A),
+            ..PLAIN
+        };
+        assert_eq!(
+            styled(text),
+            vec![
+                ("see ", PLAIN, false),
+                ("<mark #FFE08A>", PLAIN, true),
+                ("this ", highlight, false),
+                ("**", highlight, true),
+                (
+                    "word",
+                    Style {
+                        bold: true,
+                        ..highlight
+                    },
+                    false
+                ),
+                ("**", highlight, true),
+                ("</mark>", PLAIN, true),
+                (" and ", PLAIN, false),
+                ("<u #9ec7f5>", PLAIN, true),
+                (
+                    "that",
+                    Style {
+                        underline: Some(0x9EC7F5),
+                        ..PLAIN
+                    },
+                    false
+                ),
+                ("</u>", PLAIN, true),
+            ]
+        );
+        assert_eq!(plain_text(text), "see this word and that");
+        let found = marks(text);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].kind, MarkKind::Highlight);
+        assert_eq!(found[1].kind, MarkKind::Underline);
+        assert_eq!(&text[found[0].content.clone()], "this **word**");
+        let open = found[0].full.start..found[0].content.start;
+        assert!(hidden_markup(text).contains(&open));
+    }
+
+    #[test]
+    fn marks_nest_and_ignore_code() {
+        let text = "<u #9EC7F5>a <mark #FFE08A>b</mark> c</u> `<mark #FFE08A>no</mark>`";
+        let spans = styled(text);
+        assert!(spans.contains(&(
+            "b",
+            Style {
+                highlight: Some(0xFFE08A),
+                underline: Some(0x9EC7F5),
+                ..PLAIN
+            },
+            false
+        )));
+        assert_eq!(marks(text).len(), 2, "the sample inside code is not a mark");
+        assert_eq!(
+            styled("<mark #GGGGGG>no</mark>"),
+            vec![("<mark #GGGGGG>no</mark>", PLAIN, false)]
+        );
+        assert_eq!(
+            styled("<mark #FFE08A></mark>"),
+            vec![("<mark #FFE08A></mark>", PLAIN, false)]
+        );
     }
 }

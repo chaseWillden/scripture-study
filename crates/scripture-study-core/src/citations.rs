@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::time::SystemTime;
 
-use crate::document::{BlockKind, Document};
+use crate::document::{Block, BlockKind, Document};
 use crate::editor::{byte_to_char, char_to_byte, Caret};
 use crate::links;
 use crate::time::utc_parts;
@@ -41,7 +41,7 @@ impl Ref {
 
 /// A citation id that [`renumber`] will rewrite to `1`, `2`, `3`, …
 ///
-/// Scripture references (`1 Nephi 1:11`, `Ether 2:1-4`) are not numbered.
+/// Scripture references (`1 Nephi 1:11`, `Ether 2:1-4`, `1 Nephi 1:1,3`) are not numbered.
 /// `new123` is the temporary id [`insert`] uses before the rewrite.
 pub fn is_numbered(id: &str) -> bool {
     id.chars().all(|c| c.is_ascii_digit())
@@ -69,7 +69,7 @@ fn valid_id(id: &str) -> bool {
 }
 
 fn valid_id_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | ':' | '.')
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | ':' | '.' | ',')
 }
 
 /// `[^id]` at byte `i`, if there is one.
@@ -111,10 +111,139 @@ pub fn ref_at(text: &str, at: usize) -> Option<String> {
         .map(|r| r.id)
 }
 
+/// The clipboard text for `body`, with a footnote line for every citation it
+/// refers to. `body` is unchanged when it cites nothing this note defines.
+pub fn with_definitions(doc: &Document, body: &str) -> String {
+    append_definitions(doc, body, &[Block::paragraph(body)])
+}
+
+/// `body` plus footnote lines for the citations `blocks` refer to, in the
+/// order those references appear. Code is not cited. Sources the selection
+/// doesn't mention are left out, and `body` is returned as-is when there is
+/// nothing to add.
+pub(crate) fn append_definitions(doc: &Document, body: &str, blocks: &[Block]) -> String {
+    let mut notes = String::new();
+    let mut seen = Vec::new();
+    for block in blocks {
+        if matches!(block.kind, BlockKind::Code { .. }) {
+            continue;
+        }
+        for r in refs(&block.text) {
+            if seen.contains(&r.id) {
+                continue;
+            }
+            let Some(citation) = doc.citations.iter().find(|c| c.id == r.id) else {
+                continue;
+            };
+            seen.push(r.id.clone());
+            notes.push_str(&format!("[^{}]: {}\n", citation.id, citation.text));
+        }
+    }
+    if notes.is_empty() {
+        return body.to_string();
+    }
+    if body.is_empty() {
+        notes.trim_end().to_string()
+    } else {
+        format!("{body}\n\n{}", notes.trim_end())
+    }
+}
+
+/// Brings the citations `blocks` refer to onto `doc`, rewriting ids in
+/// `blocks` when keeping one would point a pasted superscript at a different
+/// source. A numbered id that already names the same text is reused. A
+/// scripture label that is already cited keeps the note's text.
+pub(crate) fn adopt(doc: &mut Document, blocks: &mut [Block], incoming: &[Citation]) {
+    if incoming.is_empty() {
+        return;
+    }
+    let mut referenced = Vec::new();
+    for block in blocks.iter() {
+        if matches!(block.kind, BlockKind::Code { .. }) {
+            continue;
+        }
+        for r in refs(&block.text) {
+            if !referenced.contains(&r.id) {
+                referenced.push(r.id.clone());
+            }
+        }
+    }
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for id in &referenced {
+        let Some(citation) = incoming.iter().find(|c| &c.id == id) else {
+            continue;
+        };
+        if let Some(same) = doc.citations.iter().find(|c| &c.id == id) {
+            if !is_numbered(id) || same.text == citation.text {
+                continue;
+            }
+            let fresh = fresh_id(doc, &remap, &referenced);
+            remap.insert(id.clone(), fresh.clone());
+            doc.citations.push(Citation {
+                id: fresh,
+                text: citation.text.clone(),
+            });
+        } else if is_numbered(id) {
+            if let Some(same) = doc
+                .citations
+                .iter()
+                .find(|c| is_numbered(&c.id) && c.text == citation.text)
+            {
+                remap.insert(id.clone(), same.id.clone());
+            } else {
+                doc.citations.push(citation.clone());
+            }
+        } else {
+            doc.citations.push(citation.clone());
+        }
+    }
+    if remap.is_empty() {
+        return;
+    }
+    for block in blocks {
+        if matches!(block.kind, BlockKind::Code { .. }) {
+            continue;
+        }
+        let found = refs(&block.text);
+        for r in found.into_iter().rev() {
+            if let Some(id) = remap.get(&r.id) {
+                block
+                    .text
+                    .replace_range(r.range.clone(), &format!("[^{id}]"));
+            }
+        }
+    }
+}
+
+/// An id no citation and none of `avoid` already uses.
+fn fresh_id(doc: &Document, remap: &HashMap<String, String>, avoid: &[String]) -> String {
+    let mut n = doc.citations.len() + 1000;
+    loop {
+        let id = format!("new{n}");
+        let taken = doc.citations.iter().any(|c| c.id == id)
+            || remap.values().any(|existing| existing == &id)
+            || avoid.iter().any(|existing| existing == &id);
+        if !taken {
+            return id;
+        }
+        n += 1;
+    }
+}
+
 /// Numbers citations in the order their references appear, rewriting the
 /// references and the list to match. Sources nothing refers to any more are
 /// dropped; references to unknown sources are left alone.
 pub fn renumber(doc: &mut Document) {
+    renumber_at(doc, None);
+}
+
+/// [`renumber`], keeping `caret` on the same side of a reference whose label
+/// changes length (`[^10]` becoming `[^1]`, or a temporary id becoming `[^2]`).
+pub(crate) fn renumber_caret(doc: &mut Document, caret: Caret) -> Caret {
+    renumber_at(doc, Some(caret)).expect("caret in")
+}
+
+fn renumber_at(doc: &mut Document, mut caret: Option<Caret>) -> Option<Caret> {
     let known: HashMap<String, String> = doc
         .citations
         .iter()
@@ -152,14 +281,14 @@ pub fn renumber(doc: &mut Document) {
             .zip(&assigned)
             .all(|((citation, id), label)| &citation.id == id && &citation.id == label);
     if already {
-        return;
+        return caret;
     }
     let number: HashMap<&str, &str> = order
         .iter()
         .zip(&assigned)
         .map(|(id, label)| (id.as_str(), label.as_str()))
         .collect();
-    for block in &mut doc.blocks {
+    for (index, block) in doc.blocks.iter_mut().enumerate() {
         if matches!(block.kind, BlockKind::Code { .. }) {
             continue;
         }
@@ -167,9 +296,16 @@ pub fn renumber(doc: &mut Document) {
         for r in found.iter().rev() {
             if let Some(n) = number.get(r.id.as_str()) {
                 if *n != r.id {
-                    block
-                        .text
-                        .replace_range(r.range.clone(), &format!("[^{n}]"));
+                    let replacement = format!("[^{n}]");
+                    let start_char = byte_to_char(&block.text, r.range.start);
+                    let end_char = byte_to_char(&block.text, r.range.end);
+                    if let Some(caret) = caret.as_mut() {
+                        if caret.block == index && end_char <= caret.char {
+                            let old_chars = end_char - start_char;
+                            caret.char = caret.char + replacement.chars().count() - old_chars;
+                        }
+                    }
+                    block.text.replace_range(r.range.clone(), &replacement);
                 }
             }
         }
@@ -182,6 +318,7 @@ pub fn renumber(doc: &mut Document) {
             text: known[id].clone(),
         })
         .collect();
+    caret
 }
 
 /// Adds a citation at character `char` of block `block`, numbered in place.
@@ -920,6 +1057,14 @@ mod tests {
             .map(|r| r.id)
             .collect();
         assert_eq!(ids, ["1 Nephi 1:11", "Ether 2:1-4"]);
+        let listed: Vec<String> = refs("see [^1 Nephi 1:1,3].")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(listed, ["1 Nephi 1:1,3"]);
+        let defined = parse_definition("[^1 Nephi 1:1,3]: Two verses.").unwrap();
+        assert_eq!(defined.id, "1 Nephi 1:1,3");
+        assert_eq!(defined.text, "Two verses.");
         let citation = parse_definition("[^Joseph Smith--History 1:2]: In this history.").unwrap();
         assert_eq!(citation.id, "Joseph Smith--History 1:2");
         assert_eq!(citation.text, "In this history.");

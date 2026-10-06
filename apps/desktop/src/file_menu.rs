@@ -1,14 +1,13 @@
-//! The scripture picker opened by the `/scripture` command: a search field and
-//! a fuzzy list of passages. Choosing one cites it.
+//! The document picker opened by the `/file-link` command: a search field and
+//! a list of notes. Choosing one inserts a link to that note.
 //!
-//! Drawn with the context menu's popup: the same corner, hairline, and shadow,
-//! a frameless search row, and results that highlight like menu items.
+//! Drawn with the same popup as the scripture picker.
 
 use eframe::egui::{
     self, vec2, Align, EventFilter, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Order, Pos2,
     Rect, RichText, Sense, TextEdit, Ui, UiBuilder,
 };
-use scripture_study_core::scriptures::{self, Hit};
+use scripture_study_core::NoteMeta;
 
 use crate::icons;
 use crate::menu;
@@ -25,7 +24,7 @@ const ICON_X: f32 = 16.0;
 const TEXT_LEFT: f32 = 32.0;
 const TEXT_RIGHT: f32 = 10.0;
 
-pub struct ScripturePicker {
+pub struct FilePicker {
     pub block: usize,
     pub at: usize,
     query: String,
@@ -34,10 +33,16 @@ pub struct ScripturePicker {
     /// Focus the search field on the frame the picker opens.
     focus: bool,
     scroll: bool,
-    hits: Vec<Hit>,
 }
 
-impl ScripturePicker {
+/// A note chosen from the picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Choice {
+    pub id: String,
+    pub title: String,
+}
+
+impl FilePicker {
     pub fn new(block: usize, at: usize, anchor: Pos2) -> Self {
         Self {
             block,
@@ -47,7 +52,6 @@ impl ScripturePicker {
             anchor,
             focus: true,
             scroll: false,
-            hits: Vec::new(),
         }
     }
 }
@@ -55,11 +59,17 @@ impl ScripturePicker {
 pub enum Outcome {
     Open,
     Cancel,
-    Insert(Hit),
+    Insert(Choice),
 }
 
-impl ScripturePicker {
-    pub fn show(&mut self, ui: &Ui, note_id: &str, palette: &Palette) -> Outcome {
+impl FilePicker {
+    pub fn show(
+        &mut self,
+        ui: &Ui,
+        note_id: &str,
+        notes: &[NoteMeta],
+        palette: &Palette,
+    ) -> Outcome {
         let mut outcome = Outcome::Open;
         let ctx = ui.ctx();
         let up = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp));
@@ -67,10 +77,10 @@ impl ScripturePicker {
         let enter = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
         let escape = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         let just_opened = self.focus;
-        let mut clicked = None;
+        let mut chosen = None;
 
         let style = menu::popup_style(ctx, palette);
-        let area = egui::Area::new(Id::new(("scripture-menu", note_id)))
+        let area = egui::Area::new(Id::new(("file-link-menu", note_id)))
             .order(Order::Foreground)
             .fixed_pos(self.anchor)
             .constrain(true)
@@ -80,14 +90,13 @@ impl ScripturePicker {
                     .show(ui, |ui| {
                         ui.set_width(WIDTH);
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        let changed = self.search_field(ui, note_id, palette);
-                        if changed {
+                        if self.search_field(ui, note_id, palette) {
                             self.selected = 0;
                             self.scroll = true;
-                            self.hits = scriptures::search(&self.query);
                         }
-                        if !self.hits.is_empty() {
-                            let n = self.hits.len();
+                        let matches = filter_notes(notes, &self.query);
+                        if !matches.is_empty() {
+                            let n = matches.len();
                             self.selected = self.selected.min(n - 1);
                             if up {
                                 self.selected = (self.selected + n - 1) % n;
@@ -99,15 +108,18 @@ impl ScripturePicker {
                             }
                         }
                         menu::separator(ui, palette);
-                        clicked = self.list(ui, palette);
+                        let clicked = self.list(ui, palette, &matches);
+                        if let Some(index) = clicked {
+                            chosen = Some(choice(matches[index]));
+                        } else if enter && !matches.is_empty() {
+                            chosen = Some(choice(matches[self.selected]));
+                        }
                     })
                     .inner;
             });
 
-        if let Some(index) = clicked {
-            outcome = Outcome::Insert(self.hits[index].clone());
-        } else if enter && !self.hits.is_empty() {
-            outcome = Outcome::Insert(self.hits[self.selected].clone());
+        if let Some(choice) = chosen {
+            outcome = Outcome::Insert(choice);
         }
         let rect = area.response.rect;
         let pressed_outside = ctx.input(|i| {
@@ -139,14 +151,14 @@ impl ScripturePicker {
                 .layout(Layout::left_to_right(Align::Center)),
         );
         let search = TextEdit::singleline(&mut self.query)
-            .id(Id::new(("scripture-search", note_id)))
+            .id(Id::new(("file-link-search", note_id)))
             .frame(Frame::NONE)
             .margin(Margin::ZERO)
             .desired_width(field.width())
             .font(FontId::proportional(FONT))
             .text_color(palette.text)
             .hint_text(
-                RichText::new("Filter by reference or words")
+                RichText::new("Filter documents")
                     .size(FONT)
                     .color(palette.faint),
             )
@@ -164,26 +176,26 @@ impl ScripturePicker {
         search.response.changed()
     }
 
-    fn list(&mut self, ui: &mut Ui, palette: &Palette) -> Option<usize> {
-        if self.query.trim().is_empty() {
-            hint(ui, palette, "1 Nephi 1:1,3 or Ether 2:1-4");
-            return None;
-        }
-        if self.hits.is_empty() {
-            hint(ui, palette, "No matching scriptures");
+    fn list(&mut self, ui: &mut Ui, palette: &Palette, matches: &[&NoteMeta]) -> Option<usize> {
+        if matches.is_empty() {
+            let text = if self.query.trim().is_empty() {
+                "No documents"
+            } else {
+                "No matching documents"
+            };
+            hint(ui, palette, text);
             return None;
         }
         let mut clicked = None;
-        let rows: Vec<(String, String)> = self
-            .hits
+        let rows: Vec<(String, String)> = matches
             .iter()
-            .map(|hit| (hit.label.clone(), hit.preview.clone()))
+            .map(|note| (note.title.clone(), note.folder().to_string()))
             .collect();
         // The area keeps last frame's size, and a scroll area will shrink to
         // fit that instead of asking it to grow. Reserve the list's height so
         // a short empty picker can open up once there are results.
         let spacing = 1.0;
-        let full = rows.len() as f32 * ROW_HEIGHT + (rows.len() - 1) as f32 * spacing;
+        let full = rows.len() as f32 * ROW_HEIGHT + (rows.len().saturating_sub(1)) as f32 * spacing;
         let height = full.min(MAX_LIST);
         if ui.available_height() + 1.0 < height {
             ui.ctx().request_repaint();
@@ -193,7 +205,7 @@ impl ScripturePicker {
             .max_height(height)
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = spacing;
-                for (n, (label, preview)) in rows.iter().enumerate() {
+                for (n, (label, folder)) in rows.iter().enumerate() {
                     let (rect, response) = ui.allocate_exact_size(
                         vec2(ui.available_width(), ROW_HEIGHT),
                         Sense::click(),
@@ -216,7 +228,7 @@ impl ScripturePicker {
                     } else {
                         palette.faint
                     };
-                    icons::quote(
+                    icons::page(
                         ui.painter(),
                         egui::pos2(rect.left() + ICON_X, rect.center().y),
                         icon_color,
@@ -224,24 +236,39 @@ impl ScripturePicker {
                     let text_width = rect.right() - TEXT_RIGHT - (rect.left() + TEXT_LEFT);
                     let label_galley =
                         crate::sidebar::elided(ui, label, FONT, palette.text, text_width);
-                    let preview_galley =
-                        crate::sidebar::elided(ui, preview, PREVIEW, palette.faint, text_width);
-                    let block = label_galley.size().y + 1.0 + preview_galley.size().y;
-                    let top = rect.center().y - block / 2.0;
                     let x = rect.left() + TEXT_LEFT;
-                    ui.painter()
-                        .galley(egui::pos2(x, top), label_galley, palette.text);
-                    ui.painter().galley(
-                        egui::pos2(x, top + block - preview_galley.size().y),
-                        preview_galley,
-                        palette.faint,
-                    );
+                    if folder.is_empty() {
+                        ui.painter().galley(
+                            egui::pos2(x, rect.center().y - label_galley.size().y / 2.0),
+                            label_galley,
+                            palette.text,
+                        );
+                    } else {
+                        let preview_galley =
+                            crate::sidebar::elided(ui, folder, PREVIEW, palette.faint, text_width);
+                        let block = label_galley.size().y + 1.0 + preview_galley.size().y;
+                        let top = rect.center().y - block / 2.0;
+                        ui.painter()
+                            .galley(egui::pos2(x, top), label_galley, palette.text);
+                        ui.painter().galley(
+                            egui::pos2(x, top + block - preview_galley.size().y),
+                            preview_galley,
+                            palette.faint,
+                        );
+                    }
                     if response.clicked() {
                         clicked = Some(n);
                     }
                 }
             });
         clicked
+    }
+}
+
+fn choice(note: &NoteMeta) -> Choice {
+    Choice {
+        id: note.id.clone(),
+        title: note.title.clone(),
     }
 }
 
@@ -260,16 +287,75 @@ fn hint(ui: &mut Ui, palette: &Palette, text: &str) {
     );
 }
 
-/// Keeps a space that was typed before `/` when a slash command is removed
-/// from the end of a block. Returns the caret, in characters.
-pub fn restore_space(text: &mut String, at: usize, space: &str) -> usize {
-    if space.is_empty() {
-        return at;
+/// Notes matching `query`, best match first. An empty query keeps `notes`'s
+/// order (most recently modified first).
+fn filter_notes<'a>(notes: &'a [NoteMeta], query: &str) -> Vec<&'a NoteMeta> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return notes.iter().collect();
     }
-    let byte = scripture_study_core::editor::char_to_byte(text, at);
-    if text[..byte].ends_with(space) {
-        return at;
+    let mut scored: Vec<(i32, usize, &NoteMeta)> = notes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, note)| {
+            let title = note.title.to_lowercase();
+            let folder = note.folder().to_lowercase();
+            let score = match_text(&query, &title)
+                .max(match_text(&query, &folder).map(|s| s.saturating_sub(10)));
+            score.map(|s| (s, i, note))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, note)| note).collect()
+}
+
+/// Scores how well `query` matches `text` (both lowercase).
+fn match_text(query: &str, text: &str) -> Option<i32> {
+    if text.is_empty() {
+        return None;
     }
-    text.insert_str(byte, space);
-    at + space.chars().count()
+    if text == query {
+        return Some(100);
+    }
+    if text.starts_with(query) {
+        return Some(80);
+    }
+    if text.split_whitespace().any(|w| w.starts_with(query)) {
+        return Some(60);
+    }
+    if text.contains(query) {
+        return Some(40);
+    }
+    let mut chars = text.chars();
+    let query = query.replace(' ', "");
+    query.chars().all(|q| chars.any(|c| c == q)).then_some(20)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn note(id: &str, title: &str) -> NoteMeta {
+        NoteMeta {
+            id: id.into(),
+            title: title.into(),
+            modified: SystemTime::UNIX_EPOCH,
+            created: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn empty_query_keeps_order_and_typing_ranks_titles() {
+        let notes = vec![
+            note("journal", "Journal"),
+            note("My Notes/grace", "Grace"),
+            note("plans/study", "Study plan"),
+        ];
+        let all = filter_notes(&notes, "");
+        assert_eq!(all[0].id, "journal");
+        assert_eq!(filter_notes(&notes, "gra")[0].title, "Grace");
+        assert_eq!(filter_notes(&notes, "plans")[0].title, "Study plan");
+        assert!(filter_notes(&notes, "zzz").is_empty());
+    }
 }

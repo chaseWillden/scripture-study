@@ -28,6 +28,7 @@ Requires a recent stable Rust toolchain (edition 2021, Rust 1.85+).
 | ⌘\ or ⌘⇧B | Show or hide the sidebar |
 | ⌘S | Save now (notes also save on their own) |
 | ⌘B / ⌘I / ⌘E / ⌘⇧X | Bold, italic, inline code, strikethrough. With no selection, the word under the caret is styled |
+| ⌘⇧H / ⌘U | Highlight or underline. With no selection, the word under the caret is marked. Select text and the color bar appears above it |
 | ⌘A | Select the whole note |
 | Shift+↑/↓/←/→, Shift+click, or drag | Select text, including across paragraphs, lists, and headings. Typing or pasting replaces the selection; ⌘C/⌘X copy it as Markdown |
 | ⌥⇧←/→ · ⌘⇧←/→ · ⌘⇧↑/↓ | Extend the selection by word · to the start/end of the line · to the start/end of the note |

@@ -3,11 +3,12 @@
 use eframe::egui::{
     self, pos2,
     text::{LayoutJob, TextFormat},
-    vec2, Align, Align2, CornerRadius, FontId, Frame, Id, Key, Margin, Modifiers, Rect, Sense,
-    TextEdit, Ui,
+    vec2, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Margin, Modifiers, Pos2,
+    Rect, Sense, TextEdit, Ui,
 };
 use scripture_study_core::scriptures::{self, Passage, VerseHit};
 
+use crate::find_bar::{self, FindBar};
 use crate::icons;
 use crate::theme::{self, Palette};
 
@@ -51,6 +52,10 @@ pub struct Reader {
     find_selected: usize,
     /// Verse to reveal on the next chapter draw.
     reveal: Option<u16>,
+    /// Find within the open chapter (Cmd+F). Same bar as a note.
+    pub chapter_find: FindBar,
+    /// Chapter the bar last searched, so a turn of the page reveals a match.
+    searched_chapter: String,
 }
 
 impl Reader {
@@ -67,6 +72,17 @@ impl Reader {
         self.open = false;
     }
 
+    /// Opens the chapter find bar, or selects its query if it's already open.
+    pub fn open_find(&mut self) {
+        self.chapter_find.open();
+    }
+
+    /// Draws the chapter find bar with its top-right corner at `top_right`.
+    pub fn show_find_bar(&mut self, ctx: &egui::Context, top_right: Pos2, palette: &Palette) {
+        self.chapter_find
+            .show(ctx, top_right, palette, find_bar::CHAPTER_HINT);
+    }
+
     /// Window title while the page is open.
     pub fn title(&self) -> Option<String> {
         if !self.open {
@@ -81,7 +97,7 @@ impl Reader {
 
     /// The sidebar: filter, scripture search, and the book list.
     pub fn show_index(&mut self, ui: &mut Ui, palette: &Palette) {
-        if escape_pressed(ui) {
+        if escape_pressed(ui) && !self.chapter_find.query_focused(ui.ctx()) {
             let filter_focus = ui.memory(|m| m.has_focus(Id::new(BOOK_FILTER)));
             let find_focus = ui.memory(|m| m.has_focus(Id::new(SCRIPTURE_FIND)));
             let handled = if filter_focus && !self.filter.is_empty() {
@@ -138,13 +154,17 @@ impl Reader {
                 ui.memory_mut(|m| m.stop_text_input());
             }
         }
-        if matches!(self.place, Place::Library) {
-            return;
-        }
-        if escape_pressed(ui) {
+        // Escape closes the find bar when its field is focused. Otherwise,
+        // from a book or chapter, it steps back. The library handles its own
+        // Escape in the sidebar.
+        if !matches!(self.place, Place::Library)
+            && escape_pressed(ui)
+            && !self.chapter_find.query_focused(ui.ctx())
+        {
             ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
             self.go_back();
         }
+        self.sync_find();
         if matches!(self.place, Place::Library) {
             return;
         }
@@ -162,6 +182,33 @@ impl Reader {
         if let Some(nav) = nav {
             self.apply(nav);
         }
+    }
+
+    /// Searches the open chapter. Anywhere else, the bar has nothing to find.
+    fn sync_find(&mut self) {
+        let key = match &self.place {
+            Place::Chapter(passage) => format!("{}:{}", passage.book, passage.number),
+            _ => String::new(),
+        };
+        if self.chapter_find.open && self.searched_chapter != key {
+            self.searched_chapter = key;
+            self.chapter_find.current = 0;
+            self.chapter_find.reveal = true;
+        }
+        if !self.chapter_find.open {
+            self.chapter_find.update_plain(&[]);
+            return;
+        }
+        let owned: Vec<String> = match &self.place {
+            Place::Chapter(passage) => passage
+                .verses
+                .iter()
+                .map(|verse| verse.text.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
+        self.chapter_find.update_plain(&texts);
     }
 
     fn scroll_id(&self) -> String {
@@ -285,7 +332,7 @@ impl Reader {
             Place::Library => None,
             Place::Book(title) => chapters(ui, palette, title),
             Place::Chapter(passage) => {
-                chapter(ui, palette, passage, reveal);
+                chapter(ui, palette, passage, reveal, &mut self.chapter_find);
                 None
             }
         };
@@ -397,12 +444,51 @@ fn chapters(ui: &mut Ui, palette: &Palette, title: &str) -> Option<Nav> {
     })
 }
 
-fn chapter(ui: &mut Ui, palette: &Palette, passage: &Passage, reveal: Option<u16>) {
-    for verse in &passage.verses {
-        let rect = verse_row(ui, verse.number, &verse.text, palette);
+fn chapter(
+    ui: &mut Ui,
+    palette: &Palette,
+    passage: &Passage,
+    reveal: Option<u16>,
+    find: &mut FindBar,
+) {
+    let (all_color, current_color) = find_bar::match_colors(ui);
+    let current = find.current_match();
+    let reveal_match = find.reveal;
+    let mut revealed = false;
+    for (index, verse) in passage.verses.iter().enumerate() {
+        let highlights: Vec<(usize, usize, Color32)> = find
+            .matches
+            .iter()
+            .filter(|m| m.block == index)
+            .map(|m| {
+                let color = if Some(*m) == current {
+                    current_color
+                } else {
+                    all_color
+                };
+                (m.start, m.end, color)
+            })
+            .collect();
+        let scroll_char = current
+            .filter(|m| reveal_match && m.block == index)
+            .map(|m| m.start);
+        if scroll_char.is_some() {
+            revealed = true;
+        }
+        let rect = verse_row(
+            ui,
+            verse.number,
+            &verse.text,
+            palette,
+            &highlights,
+            scroll_char,
+        );
         if reveal == Some(verse.number) {
             ui.scroll_to_rect(rect, Some(Align::Center));
         }
+    }
+    if revealed {
+        find.reveal = false;
     }
 }
 
@@ -435,7 +521,14 @@ fn chapter_nav(ui: &mut Ui, palette: &Palette, passage: &Passage) -> Option<Nav>
     nav
 }
 
-fn verse_row(ui: &mut Ui, number: u16, text: &str, palette: &Palette) -> Rect {
+fn verse_row(
+    ui: &mut Ui,
+    number: u16,
+    text: &str,
+    palette: &Palette,
+    highlights: &[(usize, usize, Color32)],
+    scroll_char: Option<usize>,
+) -> Rect {
     let width = ui.available_width();
     let text_width = (width - GUTTER).max(40.0);
     let mut job = LayoutJob::default();
@@ -461,8 +554,21 @@ fn verse_row(ui: &mut Ui, number: u16, text: &str, palette: &Palette) -> Rect {
         FontId::proportional(13.0),
         palette.faint,
     );
-    ui.painter()
-        .galley(pos2(rect.left() + GUTTER, rect.top()), galley, palette.text);
+    let origin = pos2(rect.left() + GUTTER, rect.top());
+    let shapes: Vec<_> = highlights
+        .iter()
+        .flat_map(|(start, end, color)| {
+            find_bar::highlight_shapes(&galley, origin, *start, *end, false, *color)
+        })
+        .collect();
+    let scroll = scroll_char.map(|start| find_bar::match_rect(&galley, origin, start));
+    for shape in shapes {
+        ui.painter().add(shape);
+    }
+    ui.painter().galley(origin, galley, palette.text);
+    if let Some(rect) = scroll {
+        ui.scroll_to_rect(rect.expand(48.0), Some(Align::Center));
+    }
     rect
 }
 

@@ -5,8 +5,9 @@
 use eframe::egui::{
     self,
     containers::menu::{MenuState, SubMenu},
-    vec2, Color32, CornerRadius, FontId, InnerResponse, KeyboardShortcut, Margin, Painter, Popup,
-    Pos2, Rect, Response, Sense, Shadow, Stroke, Ui,
+    vec2, Align, Color32, CornerRadius, FontId, InnerResponse, KeyboardShortcut, LayerId, Layout,
+    Margin, Painter, Popup, PopupAnchor, PopupCloseBehavior, PopupKind, Pos2, Rect, RectAlign,
+    Response, Sense, Shadow, Stroke, Ui,
 };
 
 use crate::icons;
@@ -49,26 +50,48 @@ pub fn menu_at<R>(
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> (R, bool) {
     let style = popup_style(ctx, palette);
-    let area = egui::Area::new(id)
-        .order(egui::Order::Foreground)
-        .fixed_pos(pos)
-        .constrain(true)
-        .show(ctx, |ui| {
-            ui.set_style(style.clone());
-            egui::Frame::popup(&style)
-                .show(ui, |ui| {
-                    ui.set_width(WIDTH);
-                    add_contents(ui)
-                })
-                .inner
-        });
-    let rect = area.response.rect;
-    let pressed_outside = ctx.input(|i| {
-        i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !rect.contains(p))
+    // A real menu popup, so a color submenu stays open while the pointer moves
+    // from its label onto the swatches.
+    let shown = Popup::new(
+        id,
+        ctx.clone(),
+        PopupAnchor::Position(pos),
+        LayerId::new(egui::Order::Foreground, id),
+    )
+    .kind(PopupKind::Menu)
+    .align(RectAlign::BOTTOM_START)
+    .align_alternatives(&[])
+    .gap(0.0)
+    .width(WIDTH)
+    .layout(Layout::top_down_justified(Align::Min))
+    .close_behavior(PopupCloseBehavior::IgnoreClicks)
+    .style({
+        let style = style.clone();
+        move |s: &mut egui::Style| *s = style.clone()
+    })
+    .show(|ui| {
+        ui.set_width(WIDTH);
+        add_contents(ui)
+    })
+    .expect("menu popup is open");
+    let rect = shown.response.rect;
+    // A submenu draws in its own layer, outside this popup. A press there is
+    // a choice, not a click away from the menu.
+    let press_pos = ctx.input(|i| {
+        i.pointer
+            .any_pressed()
+            .then(|| i.pointer.interact_pos())
+            .flatten()
+    });
+    let pressed_outside = press_pos.is_some_and(|p| {
+        !rect.contains(p)
+            && ctx
+                .layer_id_at(p)
+                .is_none_or(|layer| layer.order != egui::Order::Foreground)
     });
     let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     let open = just_opened || !(pressed_outside || escape);
-    (area.inner, open)
+    (shown.inner, open)
 }
 
 /// The context menu's popup style, so other pickers can share its chrome.
