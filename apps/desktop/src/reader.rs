@@ -1,4 +1,4 @@
-//! Scriptures: the book list lives in the sidebar, and the chapter opens beside it.
+//! Scriptures: the book list lives in the sidebar, and the reader/search page opens beside it.
 
 use eframe::egui::{
     self, pos2,
@@ -10,6 +10,7 @@ use scripture_study_core::scriptures::{self, Passage, VerseHit};
 
 use crate::find_bar::{self, FindBar};
 use crate::icons;
+use crate::menu;
 use crate::theme::{self, Palette};
 
 const VERSE_SIZE: f32 = 16.5;
@@ -17,6 +18,8 @@ const VERSE_LEADING: f32 = 26.0;
 const GUTTER: f32 = 36.0;
 const BOOK_FILTER: &str = "scripture-book-filter";
 const SCRIPTURE_FIND: &str = "scripture-find";
+const INITIAL_SEARCH_RESULTS: usize = 20;
+const SEARCH_RESULTS_PAGE: usize = 20;
 
 #[derive(Default)]
 enum Place {
@@ -32,8 +35,9 @@ enum Nav {
     Chapter {
         title: String,
         number: u16,
-        /// Verse to scroll into view. `None` opens the chapter at the top.
-        verse: Option<u16>,
+        /// Verse range to scroll into view and highlight. `None` opens the
+        /// chapter at the top without a highlighted range.
+        verse: Option<(u16, u16)>,
     },
 }
 
@@ -49,6 +53,8 @@ pub struct Reader {
     /// The query [`Self::hits`] was built for.
     find_for: String,
     hits: Vec<VerseHit>,
+    /// Number of search hits currently mounted in the results viewport.
+    visible_hits: usize,
     find_selected: usize,
     /// Verse to reveal on the next chapter draw.
     reveal: Option<u16>,
@@ -56,6 +62,10 @@ pub struct Reader {
     pub chapter_find: FindBar,
     /// Chapter the bar last searched, so a turn of the page reveals a match.
     searched_chapter: String,
+    /// Verse row indexes selected by dragging in the open chapter.
+    verse_selection: Option<(usize, usize)>,
+    /// Reference and anchor for the open verse context menu.
+    verse_menu: Option<(String, Pos2)>,
 }
 
 impl Reader {
@@ -66,6 +76,22 @@ impl Reader {
     /// Opens the scriptures page without changing the book already chosen.
     pub fn ensure_open(&mut self) {
         self.open = true;
+    }
+
+    /// Opens the chapter and selects the verses named by a scripture citation.
+    pub fn open_reference(&mut self, reference: &str) {
+        let Some(hit) = scriptures::find_verses(reference)
+            .into_iter()
+            .find(|hit| hit.label == reference)
+        else {
+            return;
+        };
+        self.open = true;
+        self.apply(Nav::Chapter {
+            title: hit.book,
+            number: hit.chapter,
+            verse: Some((hit.number, hit.end)),
+        });
     }
 
     pub fn close(&mut self) {
@@ -95,18 +121,23 @@ impl Reader {
         })
     }
 
-    /// The sidebar: filter, scripture search, and the book list.
+    #[cfg(test)]
+    pub(crate) fn highlighted_verse_range(&self) -> Option<(u16, u16)> {
+        let Place::Chapter(passage) = &self.place else {
+            return None;
+        };
+        let (start, end) = self.verse_selection?;
+        Some((passage.verses[start].number, passage.verses[end].number))
+    }
+
+    /// The sidebar: filter and the book list.
     pub fn show_index(&mut self, ui: &mut Ui, palette: &Palette) {
         if escape_pressed(ui) && !self.chapter_find.query_focused(ui.ctx()) {
             let filter_focus = ui.memory(|m| m.has_focus(Id::new(BOOK_FILTER)));
-            let find_focus = ui.memory(|m| m.has_focus(Id::new(SCRIPTURE_FIND)));
             let handled = if filter_focus && !self.filter.is_empty() {
                 self.filter.clear();
                 true
-            } else if find_focus && !self.find.is_empty() {
-                self.find.clear();
-                true
-            } else if filter_focus || find_focus {
+            } else if filter_focus {
                 ui.memory_mut(|m| m.stop_text_input());
                 true
             } else if matches!(self.place, Place::Library) {
@@ -124,7 +155,7 @@ impl Reader {
         ui.spacing_mut().item_spacing = vec2(0.0, 2.0);
         panel_heading(ui, palette, "Scriptures");
         ui.add_space(8.0);
-        let from_fields = self.fields(ui, palette);
+        self.book_filter(ui, palette);
         ui.add_space(14.0);
         let current = match &self.place {
             Place::Library => None,
@@ -134,9 +165,9 @@ impl Reader {
         let from_list = egui::ScrollArea::vertical()
             .id_salt("scripture-index")
             .auto_shrink([false, false])
-            .show(ui, |ui| self.library(ui, palette, current.as_deref()))
+            .show(ui, |ui| self.books(ui, palette, current.as_deref()))
             .inner;
-        if let Some(nav) = from_fields.or(from_list) {
+        if let Some(nav) = from_list {
             self.apply(nav);
         }
     }
@@ -164,10 +195,11 @@ impl Reader {
             ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
             self.go_back();
         }
-        self.sync_find();
         if matches!(self.place, Place::Library) {
+            self.show_library(ui, palette);
             return;
         }
+        self.sync_find();
         let scroll_id = self.scroll_id();
         let nav = {
             let from_header = self.header(ui, palette);
@@ -220,6 +252,8 @@ impl Reader {
     }
 
     fn go_back(&mut self) {
+        self.verse_selection = None;
+        self.verse_menu = None;
         self.place = match std::mem::replace(&mut self.place, Place::Library) {
             Place::Library => {
                 self.open = false;
@@ -233,14 +267,31 @@ impl Reader {
     fn apply(&mut self, nav: Nav) {
         match nav {
             Nav::Back => self.go_back(),
-            Nav::Book(title) => self.place = Place::Book(title),
+            Nav::Book(title) => {
+                self.verse_selection = None;
+                self.verse_menu = None;
+                self.place = Place::Book(title);
+            }
             Nav::Chapter {
                 title,
                 number,
                 verse,
             } => {
                 if let Some(passage) = scriptures::chapter(&title, number) {
-                    self.reveal = verse;
+                    self.verse_selection = verse.and_then(|(start, end)| {
+                        let first = passage
+                            .verses
+                            .iter()
+                            .position(|verse| verse.number == start)?;
+                        let last = passage
+                            .verses
+                            .iter()
+                            .position(|verse| verse.number == end)
+                            .unwrap_or(first);
+                        Some((first, last))
+                    });
+                    self.verse_menu = None;
+                    self.reveal = verse.map(|(start, _)| start);
                     self.place = Place::Chapter(passage);
                 }
             }
@@ -258,6 +309,7 @@ impl Reader {
         } else {
             scriptures::find_verses(&self.find)
         };
+        self.visible_hits = self.hits.len().min(INITIAL_SEARCH_RESULTS);
     }
 
     fn header(&mut self, ui: &mut Ui, palette: &Palette) -> Option<Nav> {
@@ -292,10 +344,70 @@ impl Reader {
         }
     }
 
-    fn fields(&mut self, ui: &mut Ui, palette: &Palette) -> Option<Nav> {
+    fn book_filter(&mut self, ui: &mut Ui, palette: &Palette) {
         text_field(ui, BOOK_FILTER, &mut self.filter, "Filter books", palette);
-        ui.add_space(8.0);
-        self.find_field(ui, palette)
+    }
+
+    fn show_library(&mut self, ui: &mut Ui, palette: &Palette) {
+        if escape_pressed(ui) && !self.chapter_find.query_focused(ui.ctx()) {
+            let focused = ui.memory(|m| m.has_focus(Id::new(SCRIPTURE_FIND)));
+            if focused && !self.find.is_empty() {
+                self.find.clear();
+                ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            } else if focused {
+                ui.memory_mut(|m| m.stop_text_input());
+                ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            }
+        }
+        self.sync_find();
+        heading(
+            ui,
+            palette,
+            "Scriptures",
+            Some("Search every scripture by reference or words"),
+        );
+        ui.add_space(18.0);
+        let nav = self.find_field(ui, palette);
+        ui.add_space(22.0);
+        if !self.find.trim().is_empty() {
+            results_section(ui, &format!("Results ({})", self.hits.len()), palette);
+            ui.add_space(6.0);
+            if self.hits.is_empty() {
+                note(ui, "No matching scriptures", palette);
+            } else {
+                let available_height = ui.available_height();
+                let mut chosen = None;
+                let loaded = self.visible_hits.min(self.hits.len());
+                let output = egui::ScrollArea::vertical()
+                    .id_salt("scripture-search-results")
+                    .auto_shrink([false, false])
+                    .max_height(available_height)
+                    .show(ui, |ui| {
+                        for (index, hit) in self.hits[..loaded].iter().enumerate() {
+                            if hit_row(ui, hit, index == self.find_selected, palette) {
+                                chosen = Some(open_verse(hit));
+                                break;
+                            }
+                        }
+                    });
+                let at_bottom = output.state.offset.y + output.inner_rect.height()
+                    >= output.content_size.y - 48.0;
+                if at_bottom && self.visible_hits < self.hits.len() {
+                    self.visible_hits =
+                        (self.visible_hits + SEARCH_RESULTS_PAGE).min(self.hits.len());
+                    ui.ctx().request_repaint();
+                }
+                if let Some(nav) = chosen {
+                    self.apply(nav);
+                    return;
+                }
+            }
+        } else {
+            note(ui, "Try “in the beginning” or “Genesis 1:1”", palette);
+        }
+        if let Some(nav) = nav {
+            self.apply(nav);
+        }
     }
 
     fn find_field(&mut self, ui: &mut Ui, palette: &Palette) -> Option<Nav> {
@@ -332,7 +444,15 @@ impl Reader {
             Place::Library => None,
             Place::Book(title) => chapters(ui, palette, title),
             Place::Chapter(passage) => {
-                chapter(ui, palette, passage, reveal, &mut self.chapter_find);
+                chapter(
+                    ui,
+                    palette,
+                    passage,
+                    reveal,
+                    &mut self.chapter_find,
+                    &mut self.verse_selection,
+                    &mut self.verse_menu,
+                );
                 None
             }
         };
@@ -340,32 +460,14 @@ impl Reader {
         nav
     }
 
-    fn library(&self, ui: &mut Ui, palette: &Palette, current: Option<&str>) -> Option<Nav> {
+    fn books(&self, ui: &mut Ui, palette: &Palette, current: Option<&str>) -> Option<Nav> {
         let mut chosen = None;
-        if !self.find.trim().is_empty() {
-            section(ui, "Results", palette);
-            ui.add_space(4.0);
-            if self.hits.is_empty() {
-                note(ui, "No matching scriptures", palette);
-            }
-            for (index, hit) in self.hits.iter().enumerate() {
-                if hit_row(ui, hit, index == self.find_selected, palette) {
-                    chosen = Some(open_verse(hit));
-                }
-            }
-            ui.add_space(18.0);
-        }
-
         let volumes = scriptures::volumes_matching(&self.filter);
         if volumes.is_empty() {
             if !self.filter.trim().is_empty() {
                 note(ui, "No matching books", palette);
             }
             return chosen;
-        }
-        if !self.find.trim().is_empty() {
-            section(ui, "Books", palette);
-            ui.add_space(4.0);
         }
         for (index, volume) in volumes.into_iter().enumerate() {
             if index > 0 {
@@ -388,7 +490,7 @@ fn open_verse(hit: &VerseHit) -> Nav {
     Nav::Chapter {
         title: hit.book.clone(),
         number: hit.chapter,
-        verse: Some(hit.number),
+        verse: Some((hit.number, hit.end)),
     }
 }
 
@@ -450,6 +552,8 @@ fn chapter(
     passage: &Passage,
     reveal: Option<u16>,
     find: &mut FindBar,
+    verse_selection: &mut Option<(usize, usize)>,
+    verse_menu: &mut Option<(String, Pos2)>,
 ) {
     let (all_color, current_color) = find_bar::match_colors(ui);
     let current = find.current_match();
@@ -475,14 +579,67 @@ fn chapter(
         if scroll_char.is_some() {
             revealed = true;
         }
-        let rect = verse_row(
+        let selected = verse_selection
+            .is_some_and(|(start, end)| index >= start.min(end) && index <= start.max(end));
+        let (rect, response) = verse_row(
             ui,
             verse.number,
             &verse.text,
             palette,
             &highlights,
             scroll_char,
+            selected,
         );
+        if response.drag_started() {
+            *verse_selection = Some((index, index));
+        } else if response.hovered()
+            && ui.input(|input| {
+                input.pointer.primary_down() && input.pointer.is_decidedly_dragging()
+            })
+        {
+            if let Some((anchor, _)) = *verse_selection {
+                *verse_selection = Some((anchor, index));
+            }
+        }
+        let secondary_clicked = response.hovered()
+            && ui.input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary));
+        if secondary_clicked {
+            let range = verse_selection
+                .filter(|(start, end)| index >= (*start).min(*end) && index <= (*start).max(*end))
+                .unwrap_or((index, index));
+            *verse_selection = Some(range);
+            let start = range.0.min(range.1);
+            let end = range.0.max(range.1);
+            let reference = verse_reference(
+                &passage.book,
+                passage.number,
+                passage.verses[start].number,
+                passage.verses[end].number,
+            );
+            let position = ui
+                .input(|input| input.pointer.interact_pos())
+                .unwrap_or(response.rect.right_bottom());
+            *verse_menu = Some((reference, position));
+        }
+        if let Some((reference, position)) = verse_menu.take() {
+            let (copy, open) = menu::menu_at(
+                ui.ctx(),
+                egui::Id::new("scripture-verse-menu"),
+                position,
+                palette,
+                secondary_clicked,
+                |ui| {
+                    menu::Item::new("Copy reference")
+                        .icon(icons::quote)
+                        .show(ui, palette)
+                },
+            );
+            if copy {
+                ui.ctx().copy_text(reference.clone());
+            } else if open {
+                *verse_menu = Some((reference, position));
+            }
+        }
         if reveal == Some(verse.number) {
             ui.scroll_to_rect(rect, Some(Align::Center));
         }
@@ -528,7 +685,8 @@ fn verse_row(
     palette: &Palette,
     highlights: &[(usize, usize, Color32)],
     scroll_char: Option<usize>,
-) -> Rect {
+    selected: bool,
+) -> (Rect, egui::Response) {
     let width = ui.available_width();
     let text_width = (width - GUTTER).max(40.0);
     let mut job = LayoutJob::default();
@@ -545,8 +703,12 @@ fn verse_row(
     );
     let galley = ui.painter().layout_job(job);
     let (rect, response) =
-        ui.allocate_exact_size(vec2(width, galley.size().y + 12.0), Sense::hover());
+        ui.allocate_exact_size(vec2(width, galley.size().y + 12.0), Sense::click_and_drag());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+    if selected {
+        ui.painter()
+            .rect_filled(rect, 4.0, palette.menu_selected.gamma_multiply(0.45));
+    }
     ui.painter().text(
         pos2(rect.left() + GUTTER - 10.0, rect.top() + 2.0),
         Align2::RIGHT_TOP,
@@ -569,7 +731,24 @@ fn verse_row(
     if let Some(rect) = scroll {
         ui.scroll_to_rect(rect.expand(48.0), Some(Align::Center));
     }
-    rect
+    if selected {
+        // Keep a small edge marker above the row fill so the selected range
+        // remains clear when find highlights are also present.
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
+            1.5,
+            palette.menu_selected,
+        );
+    }
+    (rect, response)
+}
+
+fn verse_reference(book: &str, chapter: u16, start: u16, end: u16) -> String {
+    if start == end {
+        format!("{book} {chapter}:{start}")
+    } else {
+        format!("{book} {chapter}:{start}-{end}")
+    }
 }
 
 fn text_field(ui: &mut Ui, id: &str, text: &mut String, hint: &str, palette: &Palette) {
@@ -721,6 +900,18 @@ fn row(ui: &mut Ui, title: &str, selected: bool, palette: &Palette) -> bool {
 
 fn section(ui: &mut Ui, title: &str, palette: &Palette) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
+    ui.painter().text(
+        pos2(rect.left() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(13.0),
+        palette.faint,
+    );
+}
+
+fn results_section(ui: &mut Ui, title: &str, palette: &Palette) {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
     ui.painter().text(
         pos2(rect.left() + 8.0, rect.center().y),
         Align2::LEFT_CENTER,

@@ -1,15 +1,41 @@
 //! The folder tree shown when organizing notes.
 
+use std::cmp::Ordering;
+
 use crate::store::{self, NoteMeta};
+
+/// Compare leading numbers by value, then the remaining text alphabetically.
+/// Comparing digit strings avoids overflow for arbitrarily long numbers.
+fn compare_names(a: &str, b: &str) -> Ordering {
+    let a = a.to_lowercase();
+    let b = b.to_lowercase();
+    let split_number = |text: &str| text.bytes().take_while(u8::is_ascii_digit).count();
+    let a_end = split_number(&a);
+    let b_end = split_number(&b);
+    match (a_end > 0, b_end > 0) {
+        (true, true) => {
+            let a_number = a[..a_end].trim_start_matches('0');
+            let b_number = b[..b_end].trim_start_matches('0');
+            a_number
+                .len()
+                .cmp(&b_number.len())
+                .then_with(|| a_number.cmp(b_number))
+                .then_with(|| a[a_end..].cmp(&b[b_end..]))
+        }
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a.cmp(&b),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Folder {
     /// Full path, `""` for the top level.
     pub path: String,
     pub name: String,
-    /// Subfolders, sorted by name.
+    /// Subfolders, sorted by name with leading numbers compared numerically.
     pub folders: Vec<Folder>,
-    /// Notes directly in this folder, most recent first.
+    /// Notes sorted by title with leading numbers compared numerically.
     pub notes: Vec<NoteMeta>,
 }
 
@@ -58,15 +84,18 @@ impl Folder {
     }
 
     fn sort(&mut self) {
-        self.folders.sort_by_key(|f| f.name.to_lowercase());
+        self.folders
+            .sort_by(|a, b| compare_names(&a.name, &b.name).then(a.path.cmp(&b.path)));
+        self.notes
+            .sort_by(|a, b| compare_names(&a.title, &b.title).then(a.id.cmp(&b.id)));
         for folder in &mut self.folders {
             folder.sort();
         }
     }
 }
 
-/// Builds the tree from every folder path and every note. Notes keep the
-/// order they're given in (the store lists newest first).
+/// Builds the tree from every folder path and every note. Notes are sorted by
+/// title within each folder, comparing leading numbers numerically.
 pub fn tree(folders: &[String], notes: &[NoteMeta]) -> Folder {
     let mut root = Folder::new("");
     for path in folders {
@@ -114,9 +143,9 @@ mod tests {
             &["work".into(), "Personal".into(), "work/Old".into()],
             &[
                 note("top"),
-                note("work/a"),
-                note("work/Old/b"),
                 note("work/c"),
+                note("work/Old/b"),
+                note("work/a"),
             ],
         );
         assert_eq!(names(&root), ["Personal", "work"]);
@@ -128,7 +157,7 @@ mod tests {
         assert_eq!(
             work.notes,
             [note("work/a"), note("work/c")],
-            "keeps input order"
+            "sorts note titles"
         );
         assert_eq!(work.folders[0].path, "work/Old");
         assert_eq!(work.note_count(), 3);
@@ -141,6 +170,93 @@ mod tests {
         assert_eq!(root.folders[0].path, "a");
         assert_eq!(root.folders[0].folders[0].path, "a/b");
         assert_eq!(root.folders[0].folders[0].notes, [note("a/b/c")]);
+    }
+
+    #[test]
+    fn numbered_titles_sort_numerically_then_alphabetically() {
+        let titles = [
+            "10 - Laman",
+            "2 - Zebra",
+            "1 - Destruction",
+            "2 - apple",
+            "1 Nephi Prophecies",
+            "banana",
+            "Apple",
+            "02 - Banana",
+        ];
+        let notes: Vec<_> = titles
+            .iter()
+            .enumerate()
+            .map(|(i, title)| {
+                let mut meta = note(&format!("Prophecies/{i}"));
+                meta.title = (*title).into();
+                meta
+            })
+            .collect();
+        let root = tree(&[], &notes);
+        let actual: Vec<_> = root.folders[0]
+            .notes
+            .iter()
+            .map(|n| n.title.as_str())
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                "1 - Destruction",
+                "1 Nephi Prophecies",
+                "2 - apple",
+                "02 - Banana",
+                "2 - Zebra",
+                "10 - Laman",
+                "Apple",
+                "banana",
+            ]
+        );
+    }
+
+    #[test]
+    fn numbered_folders_sort_at_every_level() {
+        let root = tree(
+            &[
+                "10 Books/10 Zebra".into(),
+                "2 Books".into(),
+                "1 Books".into(),
+                "10 Books/2 Zebra".into(),
+                "10 Books/2 apple".into(),
+                "Apple".into(),
+            ],
+            &[],
+        );
+        assert_eq!(names(&root), ["1 Books", "2 Books", "10 Books", "Apple"]);
+        assert_eq!(names(&root.folders[2]), ["2 apple", "2 Zebra", "10 Zebra"]);
+    }
+
+    #[test]
+    fn numeric_sort_handles_zero_large_numbers_and_equal_titles() {
+        let titles = [
+            "184467440737095516160 apple",
+            "184467440737095516159 Zebra",
+            "00 Zebra",
+            "0 apple",
+            "2 Apple",
+            "02 apple",
+            "Chapter 2",
+            "Chapter 10",
+            "",
+        ];
+        let notes: Vec<_> = titles
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, title)| {
+                let mut meta = note(&format!("{i}"));
+                meta.title = (*title).into();
+                meta
+            })
+            .collect();
+        let root = tree(&[], &notes);
+        let ids: Vec<_> = root.notes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["3", "2", "4", "5", "1", "0", "8", "7", "6"]);
     }
 
     #[test]

@@ -66,9 +66,15 @@ enum Spec {
     Rejected,
 }
 
+const MAX_BOOK_HITS: usize = 40;
+
 fn catalog() -> &'static Catalog {
+    catalog_cell().get_or_init(Catalog::load)
+}
+
+fn catalog_cell() -> &'static OnceLock<Catalog> {
     static CATALOG: OnceLock<Catalog> = OnceLock::new();
-    CATALOG.get_or_init(Catalog::load)
+    &CATALOG
 }
 
 impl Catalog {
@@ -114,30 +120,67 @@ impl Catalog {
     }
 
     fn search(&self, query: &str) -> Vec<Hit> {
+        self.search_limited(query, usize::MAX)
+    }
+
+    fn search_limited(&self, query: &str, limit: usize) -> Vec<Hit> {
         let query = normalize(query);
-        if query.is_empty() {
+        // A single character is only the beginning of a reference (most
+        // notably the `1` in `1 Nephi`). It cannot produce a useful result,
+        // and letting it fall through to fuzzy matching scans and sorts the
+        // entire verse catalog on every first keystroke.
+        if limit == 0 || query.chars().count() < 2 {
             return Vec::new();
         }
         let mut hits = Vec::new();
         if let Some((book, spec)) = self.parse_ref(&query) {
+            let is_book = matches!(&spec, Spec::Book);
             self.structured_hits(book, spec, &mut hits);
+            // A recognized book name has already produced bounded, local
+            // results above. Do not fall back to fuzzy matching and scan the
+            // entire catalog while the user is still typing its chapter.
+            if is_book {
+                hits.truncate(limit);
+                return hits;
+            }
         }
         if hits.is_empty() {
-            self.fuzzy_hits(&query, &mut hits);
+            self.fuzzy_hits(&query, limit, &mut hits);
         }
-        hits.truncate(40);
+        hits.truncate(limit);
         hits
+    }
+
+    /// Reference autocomplete never scans verse text. Partial book names are
+    /// matched against the small book index, then only that book is read.
+    fn reference_hits(&self, query: &str, limit: usize) -> Option<Vec<Hit>> {
+        let query = normalize(query);
+        if limit == 0 || query.chars().count() < 2 {
+            return Some(Vec::new());
+        }
+        let (book, spec) = self
+            .parse_ref(&query)
+            .or_else(|| self.book_match(&query).map(|book| (book, Spec::Book)))?;
+        let mut hits = Vec::new();
+        self.structured_hits(book, spec, &mut hits);
+        hits.truncate(limit);
+        Some(hits)
     }
 
     fn structured_hits(&self, book: usize, spec: Spec, hits: &mut Vec<Hit>) {
         match spec {
-            Spec::Rejected | Spec::Book => {}
+            Spec::Rejected => {}
+            Spec::Book => {
+                let book_data = &self.books[book];
+                let end = book_data.end.min(book_data.start + MAX_BOOK_HITS);
+                for index in book_data.start..end {
+                    let verse = &self.verses[index];
+                    self.push_verse(hits, book, verse.chapter, verse.number);
+                }
+            }
             Spec::Chapter(chapter) => {
                 for number in self.verse_numbers(book, chapter) {
                     self.push_verse(hits, book, chapter, number);
-                    if hits.len() >= 40 {
-                        break;
-                    }
                 }
             }
             Spec::Verses { chapter, spans } => {
@@ -191,12 +234,6 @@ impl Catalog {
                     break;
                 };
                 found.push((number, index));
-                if found.len() >= 80 {
-                    break;
-                }
-            }
-            if found.len() >= 80 {
-                break;
             }
         }
         found.sort_by_key(|(number, _)| *number);
@@ -345,7 +382,7 @@ impl Catalog {
         }
     }
 
-    fn fuzzy_hits(&self, query: &str, hits: &mut Vec<Hit>) {
+    fn fuzzy_hits(&self, query: &str, limit: usize, hits: &mut Vec<Hit>) {
         let compact_query = compact(query);
         let words: Vec<&str> = query
             .split_whitespace()
@@ -358,15 +395,24 @@ impl Catalog {
                 scored.push((score, index));
             }
         }
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        for (_, index) in scored.into_iter().take(40) {
+        let compare = |a: &(i32, usize), b: &(i32, usize)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
+        // Select only the best autocomplete candidates before building hits.
+        // The reader still requests every match through `search`.
+        if scored.len() > limit {
+            scored.select_nth_unstable_by(limit, compare);
+            scored.truncate(limit);
+        }
+        scored.sort_unstable_by(compare);
+        for (_, index) in scored {
             let verse = &self.verses[index];
             let book = self
                 .books
                 .iter()
                 .position(|book| (book.start..book.end).contains(&index))
                 .expect("verse belongs to a book");
-            self.push_verse(hits, book, verse.chapter, verse.number);
+            // Every scored index is unique. Checking all previous labels here
+            // made broad word searches quadratic in the number of matches.
+            hits.push(self.hit(book, verse.chapter, verse.number, verse.number, &[index]));
         }
     }
 }
@@ -686,54 +732,86 @@ pub fn search(query: &str) -> Vec<Hit> {
     catalog().search(query)
 }
 
+/// Best `limit` matches for autocomplete, without constructing every match.
+/// May load the catalog; call on a worker thread.
+pub fn search_limited(query: &str, limit: usize) -> Vec<Hit> {
+    catalog().search_limited(query, limit)
+}
+
+/// Immediate reference suggestions from the book index if the catalog is ready.
+/// `None` means loading or a word query that needs a background search.
+pub fn reference_search_if_ready(query: &str, limit: usize) -> Option<Vec<Hit>> {
+    catalog_cell().get()?.reference_hits(query, limit)
+}
+
+/// Starts loading the bundled scripture catalog without blocking the caller.
+///
+/// The first search used to pay the full catalog-load cost on the UI thread.
+/// Callers that need a responsive UI should call this during application
+/// startup and use [`search_if_ready`] while the catalog is loading.
+pub fn warm() {
+    static WARMING: OnceLock<()> = OnceLock::new();
+    WARMING.get_or_init(|| {
+        std::thread::spawn(|| {
+            let _ = catalog();
+        });
+    });
+}
+
+/// Searches without waiting for the catalog to finish loading.
+///
+/// Returns `None` while [`warm`] is still building the catalog.
+pub fn search_if_ready(query: &str) -> Option<Vec<Hit>> {
+    catalog_cell().get().map(|catalog| catalog.search(query))
+}
+
 /// One verse found by [`find_verses`], best matches first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerseHit {
     pub book: String,
     pub chapter: u16,
     pub number: u16,
+    /// Last verse in the matched passage. Equal to [`Self::number`] for a
+    /// single-verse result.
+    pub end: u16,
     pub label: String,
     /// Short verse text for a result row.
     pub preview: String,
 }
 
-/// The best scripture matches for `query`, at most ten.
+/// The best scripture matches for `query`.
 ///
 /// A reference (`Ether 2:1`, `D&C 4`) wins. Otherwise the words are matched
 /// against the verse text, so a partial phrase still finds the verse.
 pub fn find_verses(query: &str) -> Vec<VerseHit> {
-    const LIMIT: usize = 10;
     search(query)
         .into_iter()
         .filter_map(|hit| {
-            let (book, chapter, number) = locate(&hit.label)?;
+            let (book, chapter, number, end) = locate(&hit.label)?;
             Some(VerseHit {
                 book,
                 chapter,
                 number,
+                end,
                 label: hit.label,
                 preview: hit.preview,
             })
         })
-        .take(LIMIT)
         .collect()
 }
 
 /// `Genesis 1:1`, `Ether 2:1-4`, or `1 Nephi 1:1,3` into book, chapter, and the first verse.
-fn locate(label: &str) -> Option<(String, u16, u16)> {
+fn locate(label: &str) -> Option<(String, u16, u16, u16)> {
     let (head, verses) = label.rsplit_once(':')?;
-    let number: u16 = verses
-        .split([',', '-', '–', '—'])
-        .next()?
-        .trim()
-        .parse()
-        .ok()?;
+    let mut numbers = verses.split([',', '-', '–', '—']);
+    let number: u16 = numbers.next()?.trim().parse().ok()?;
+    let end = numbers.next_back().unwrap_or(verses).trim().parse().ok()?;
     let (book, chapter) = head.rsplit_once(' ')?;
     let chapter: u16 = chapter.parse().ok()?;
     if book.is_empty() {
         return None;
     }
-    Some((book.to_string(), chapter, number))
+    Some((book.to_string(), chapter, number, end))
 }
 
 /// One volume in standard order, with the books that belong to it.
@@ -867,6 +945,69 @@ mod tests {
     }
 
     #[test]
+    fn an_incomplete_numeric_reference_matches_nothing() {
+        assert!(search("1").is_empty());
+        assert_eq!(search("1 n")[0].label, "1 Nephi 1:1");
+        assert_eq!(search("1 nephi")[0].label, "1 Nephi 1:1");
+    }
+
+    #[test]
+    fn autocomplete_keeps_the_best_matches_without_capping_reader_search() {
+        for query in [
+            "and the",
+            "behold",
+            "1 Nephi 1",
+            "Ether 2:1-4",
+            "unknown verse xyz",
+        ] {
+            let all = search(query);
+            assert_eq!(
+                search_limited(query, 10),
+                all.into_iter().take(10).collect::<Vec<_>>()
+            );
+            assert!(search_limited(query, 0).is_empty());
+        }
+    }
+
+    #[test]
+    fn reference_autocomplete_filters_each_prefix_without_a_word_search() {
+        let catalog = catalog();
+        for query in [
+            "1 N",
+            "1 Ne",
+            "1 Nep",
+            "1 Neph",
+            "1 Nephi",
+            "1 Nephi 1",
+            "1 Nephi 1:",
+        ] {
+            let hits = catalog.reference_hits(query, 40).expect(query);
+            assert_eq!(hits[0].label, "1 Nephi 1:1", "{query}");
+            assert!(hits.len() <= 40);
+        }
+        assert_eq!(
+            catalog.reference_hits("1 Nephi 1:11", 40).unwrap()[0].label,
+            "1 Nephi 1:11"
+        );
+        assert!(catalog.reference_hits("and the", 40).is_none());
+
+        // Report warm-query latency separately from catalog initialization.
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            for query in ["1 N", "1 Nephi", "1 Nephi 1", "1 Nephi 1:11"] {
+                std::hint::black_box(catalog.reference_hits(query, 40));
+            }
+        }
+        eprintln!(
+            "Reference autocomplete: {:?} average per keystroke",
+            start.elapsed() / 400
+        );
+        let start = std::time::Instant::now();
+        std::hint::black_box(catalog.search_limited("and the", 40));
+        eprintln!("Broad autocomplete query: {:?}", start.elapsed());
+    }
+
+    #[test]
     fn exact_verse_and_range_use_the_reference_as_the_label() {
         let nephi = &search("1 Nephi 1:11")[0];
         assert_eq!(nephi.label, "1 Nephi 1:11");
@@ -947,6 +1088,17 @@ mod tests {
     }
 
     #[test]
+    fn a_word_search_returns_every_matching_verse() {
+        let hits = find_verses("behold");
+
+        assert!(hits.len() > 40, "expected more than the old 40-result cap");
+        assert!(hits.iter().all(|hit| {
+            hit.preview.to_lowercase().contains("behold")
+                || search(&hit.label)[0].text.to_lowercase().contains("behold")
+        }));
+    }
+
+    #[test]
     fn volumes_list_every_book_in_print_order() {
         let volumes = volumes();
         assert_eq!(
@@ -994,7 +1146,7 @@ mod tests {
         assert_eq!(found[0].book, "Genesis");
         assert_eq!(found[0].chapter, 1);
         assert_eq!(found[0].number, 1);
-        assert_eq!(find_verses("and the").len(), 10);
+        assert!(find_verses("and the").len() > 10);
         assert!(find_verses("   ").is_empty());
         assert_eq!(
             find_verses("js-h 1:2")[0].label,

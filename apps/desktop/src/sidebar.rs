@@ -106,6 +106,38 @@ struct FolderEdit {
     focus: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TreeItem {
+    Folder { path: String, has_children: bool },
+    Note { id: String, folder: String },
+}
+
+impl TreeItem {
+    fn folder_key(path: &str) -> String {
+        format!("folder:{path}")
+    }
+
+    fn note_key(id: &str) -> String {
+        format!("note:{id}")
+    }
+
+    fn key(&self) -> String {
+        match self {
+            Self::Folder { path, .. } => Self::folder_key(path),
+            Self::Note { id, .. } => Self::note_key(id),
+        }
+    }
+
+    fn is_descendant_of(&self, folder: &str) -> bool {
+        match self {
+            Self::Folder { path, .. } => path.starts_with(&format!("{folder}/")),
+            Self::Note { folder: parent, .. } => {
+                parent == folder || parent.starts_with(&format!("{folder}/"))
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Search {
     query: String,
@@ -124,6 +156,11 @@ pub struct Sidebar {
     expanded: HashSet<String>,
     editing: Option<FolderEdit>,
     renaming: Option<NoteRename>,
+    /// The folder-tree item that owns keyboard focus, encoded as
+    /// `folder:<path>` or `note:<id>`.
+    tree_selection: Option<String>,
+    tree_focus_request: Option<String>,
+    tree_keyboard_active: bool,
 }
 
 impl Default for Sidebar {
@@ -131,11 +168,14 @@ impl Default for Sidebar {
         Self {
             open: true,
             panel_visible: true,
-            view: View::Recent,
+            view: View::Folders,
             search: None,
             expanded: HashSet::new(),
             editing: None,
             renaming: None,
+            tree_selection: None,
+            tree_focus_request: None,
+            tree_keyboard_active: false,
         }
     }
 }
@@ -189,6 +229,11 @@ impl Sidebar {
         self.renaming.as_ref().map(|r| r.title.as_str())
     }
 
+    #[cfg(test)]
+    pub(crate) fn request_tree_focus(&mut self, key: String) {
+        self.tree_focus_request = Some(key);
+    }
+
     /// Whether a name is being typed in the sidebar.
     pub fn is_typing(&self) -> bool {
         self.renaming.is_some() || self.editing.is_some()
@@ -198,6 +243,7 @@ impl Sidebar {
     pub fn rename_note(&mut self, id: &str, title: &str) {
         self.open = true;
         self.search = None;
+        self.tree_keyboard_active = false;
         if self.view == View::Folders {
             self.reveal(store::parent(id));
         }
@@ -596,6 +642,9 @@ impl Sidebar {
         palette: &Palette,
     ) -> Option<SidebarAction> {
         let mut action = None;
+        if let Some(a) = self.handle_tree_keyboard(ui, notes.tree) {
+            action = Some(a);
+        }
         let header = self.header(ui, "Folders", palette);
         let button = Rect::from_center_size(
             header.right_center() - vec2(PAD_X + 12.0, 0.0),
@@ -629,16 +678,149 @@ impl Sidebar {
                 // Dropping a note on the empty space below moves it to the top level.
                 let rest = ui.available_rect_before_wrap();
                 let rest = rest.with_max_y(rest.max.y.max(rest.min.y + 80.0));
-                let zone = ui.allocate_rect(rest, Sense::hover());
+                let zone = ui.allocate_rect(rest, Sense::click());
+                if zone.clicked() {
+                    if let Some(folder) = notes.tree.folders.first() {
+                        let key = TreeItem::folder_key(&folder.path);
+                        self.tree_selection = Some(key.clone());
+                        self.tree_focus_request = Some(key);
+                        self.tree_keyboard_active = true;
+                    }
+                }
                 if let Some(a) = drop_into(ui, &zone, rest, "", palette) {
                     action = Some(a);
                 }
+                menu::context_menu(&zone, palette, |ui| {
+                    if Item::new("New folder")
+                        .icon(icons::new_folder)
+                        .shortcut(NEW_FOLDER)
+                        .show(ui, palette)
+                    {
+                        self.new_folder_in("");
+                    }
+                    if Item::new("New document")
+                        .icon(icons::compose)
+                        .show(ui, palette)
+                    {
+                        action = Some(SidebarAction::New);
+                    }
+                });
             });
         action
     }
 
+    fn handle_tree_keyboard(&mut self, ui: &Ui, tree: &Folder) -> Option<SidebarAction> {
+        let selection = self.tree_selection.clone()?;
+        // A selection change requests focus while the row is being painted
+        // later in this frame. Allow the next key through during that handoff
+        // so rapid key presses do not lose navigation events.
+        if !self.tree_keyboard_active {
+            return None;
+        }
+        // A tree selection can outlive focus moving back to the document.
+        // Only let the tree consume navigation keys while its selected row
+        // still owns keyboard focus (or is waiting to receive it after a
+        // selection change).
+        let items = self.visible_tree_items(tree);
+        let tree_has_focus = items.iter().any(|item| {
+            ui.memory(|memory| memory.has_focus(Id::new(("sidebar-tree-row", item.key()))))
+        });
+        let tree_focus_pending = self.tree_focus_request.as_deref() == Some(selection.as_str());
+        if !tree_has_focus && !tree_focus_pending && ui.input(|input| input.key_pressed(Key::Enter))
+        {
+            return None;
+        }
+        if ui.input(|input| input.modifiers.any()) {
+            return None;
+        }
+        let index = items.iter().position(|item| item.key() == selection)?;
+        let key = |key| ui.input_mut(|i| i.consume_key(Modifiers::NONE, key));
+
+        if key(Key::ArrowDown) {
+            if let Some(next) = items.get(index + 1) {
+                let key = next.key();
+                self.tree_selection = Some(key.clone());
+                self.tree_focus_request = Some(key);
+            }
+        } else if key(Key::ArrowUp) {
+            if let Some(previous) = index.checked_sub(1).and_then(|i| items.get(i)) {
+                let key = previous.key();
+                self.tree_selection = Some(key.clone());
+                self.tree_focus_request = Some(key);
+            }
+        } else if key(Key::ArrowRight) {
+            if let TreeItem::Folder { path, .. } = &items[index] {
+                if !self.expanded.contains(path) {
+                    self.expanded.insert(path.clone());
+                } else if let Some(child) = items.get(index + 1) {
+                    if child.is_descendant_of(path) {
+                        let key = child.key();
+                        self.tree_selection = Some(key.clone());
+                        self.tree_focus_request = Some(key);
+                    }
+                }
+            }
+        } else if key(Key::ArrowLeft) {
+            match &items[index] {
+                TreeItem::Folder { path, .. } if self.expanded.contains(path) => {
+                    self.expanded.remove(path);
+                }
+                TreeItem::Folder { path, .. } | TreeItem::Note { id: path, .. } => {
+                    let parent = store::parent(path);
+                    if parent.is_empty() {
+                        self.tree_selection = None;
+                    } else {
+                        let key = TreeItem::folder_key(parent);
+                        self.tree_selection = Some(key.clone());
+                        self.tree_focus_request = Some(key);
+                    }
+                }
+            }
+        } else if key(Key::Enter) {
+            match &items[index] {
+                TreeItem::Folder { path, .. } => {
+                    if self.expanded.contains(path) {
+                        self.expanded.remove(path);
+                    } else {
+                        self.expanded.insert(path.clone());
+                    }
+                }
+                TreeItem::Note { id, .. } => {
+                    self.tree_keyboard_active = false;
+                    return Some(SidebarAction::Open(id.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    fn visible_tree_items(&self, tree: &Folder) -> Vec<TreeItem> {
+        fn add(items: &mut Vec<TreeItem>, folder: &Folder, expanded: &HashSet<String>) {
+            for sub in &folder.folders {
+                items.push(TreeItem::Folder {
+                    path: sub.path.clone(),
+                    has_children: !sub.is_empty(),
+                });
+                if expanded.contains(&sub.path) {
+                    add(items, sub, expanded);
+                }
+            }
+            for note in &folder.notes {
+                items.push(TreeItem::Note {
+                    id: note.id.clone(),
+                    folder: folder.path.clone(),
+                });
+            }
+        }
+
+        let mut items = Vec::new();
+        add(&mut items, tree, &self.expanded);
+        items
+    }
+
     fn new_folder_in(&mut self, parent: &str) {
         self.reveal(parent);
+        self.tree_keyboard_active = false;
         self.renaming = None;
         self.editing = Some(FolderEdit {
             parent: parent.to_string(),
@@ -697,9 +879,15 @@ impl Sidebar {
     ) -> Option<SidebarAction> {
         let mut action = None;
         let expanded = self.expanded.contains(&folder.path);
-        let (rect, row) = row(ui, ROW_HEIGHT);
+        let (rect, row) = tree_row(ui, ROW_HEIGHT, TreeItem::folder_key(&folder.path));
         row.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &folder.name));
-        paint_row_bg(ui, rect, &row, false, palette);
+        let selected = self.tree_selection.as_deref() == Some(&TreeItem::folder_key(&folder.path));
+        paint_row_bg(ui, rect, &row, selected, palette);
+        let key = TreeItem::folder_key(&folder.path);
+        if self.tree_focus_request.as_deref() == Some(key.as_str()) {
+            row.request_focus();
+            self.tree_focus_request = None;
+        }
 
         let x = rect.left() + 10.0 + depth as f32 * INDENT;
         let y = rect.center().y;
@@ -720,7 +908,7 @@ impl Sidebar {
             FontId::proportional(12.0),
             palette.faint,
         );
-        let name_left = x + 32.0;
+        let name_left = x + 36.0;
         let name_width = rect.right() - 10.0 - count.size().x - 8.0 - name_left;
         let name = elided(ui, &folder.name, 14.0, palette.text, name_width);
         ui.painter().galley(
@@ -735,6 +923,10 @@ impl Sidebar {
         ui.painter().galley(count_pos, count, palette.faint);
 
         if row.clicked() {
+            self.tree_selection = Some(key.clone());
+            self.tree_focus_request = Some(key);
+            self.tree_keyboard_active = true;
+            row.request_focus();
             if expanded {
                 self.expanded.remove(&folder.path);
             } else {
@@ -764,6 +956,7 @@ impl Sidebar {
                 .shortcut(RENAME)
                 .show(ui, palette)
             {
+                self.tree_keyboard_active = false;
                 self.renaming = None;
                 self.editing = Some(FolderEdit {
                     parent: store::parent(&folder.path).to_string(),
@@ -816,7 +1009,7 @@ impl Sidebar {
             palette.text,
         );
         let field = Rect::from_min_max(
-            egui::pos2(x + 32.0, rect.top()),
+            egui::pos2(x + 36.0, rect.top()),
             egui::pos2(rect.right() - 8.0, rect.bottom()),
         );
 
@@ -834,6 +1027,8 @@ impl Sidebar {
             .text_color(palette.text)
             .hint_text(egui::RichText::new("Folder name").color(palette.faint))
             .event_filter(egui::EventFilter {
+                horizontal_arrows: true,
+                vertical_arrows: true,
                 escape: true,
                 ..Default::default()
             })
@@ -891,13 +1086,13 @@ impl Sidebar {
         } else {
             note.title.as_str()
         };
-        let (rect, row) = row(ui, ROW_HEIGHT);
+        let (rect, row) = tree_row(ui, ROW_HEIGHT, TreeItem::note_key(&note.id));
         let x = rect.left() + 10.0 + depth as f32 * INDENT + 14.0;
         let y = rect.center().y;
 
         if self.is_renaming(&note.id) {
             let field = Rect::from_min_max(
-                egui::pos2(x + 18.0, rect.top()),
+                egui::pos2(x + 22.0, rect.top()),
                 egui::pos2(rect.right() - 10.0, rect.bottom()),
             );
             let action = self.note_title_field(ui, rect, field, palette);
@@ -907,17 +1102,23 @@ impl Sidebar {
 
         let row = row.interact(Sense::click_and_drag());
         row.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
-        paint_row_bg(ui, rect, &row, is_current, palette);
+        let selected = self.tree_selection.as_deref() == Some(&TreeItem::note_key(&note.id));
+        paint_row_bg(ui, rect, &row, is_current || selected, palette);
+        let key = TreeItem::note_key(&note.id);
+        if self.tree_focus_request.as_deref() == Some(key.as_str()) {
+            row.request_focus();
+            self.tree_focus_request = None;
+        }
         icons::page(ui.painter(), egui::pos2(x + 6.0, y), palette.faint);
         let galley = elided(
             ui,
             title,
             14.0,
             palette.text,
-            rect.right() - 10.0 - (x + 18.0),
+            rect.right() - 10.0 - (x + 22.0),
         );
         ui.painter().galley(
-            egui::pos2(x + 18.0, y - galley.size().y / 2.0),
+            egui::pos2(x + 22.0, y - galley.size().y / 2.0),
             galley,
             palette.text,
         );
@@ -927,6 +1128,10 @@ impl Sidebar {
         if row.double_clicked() {
             self.rename_note(&note.id, title);
         } else if row.clicked() {
+            self.tree_selection = Some(key.clone());
+            self.tree_focus_request = Some(key);
+            // Opening a note transfers keyboard ownership back to the document.
+            self.tree_keyboard_active = false;
             action = Some(SidebarAction::Open(note.id.clone()));
         }
         menu::context_menu(&row, palette, |ui| {
@@ -966,6 +1171,8 @@ impl Sidebar {
             .text_color(palette.text)
             .hint_text(egui::RichText::new(store::UNTITLED).color(palette.faint))
             .event_filter(egui::EventFilter {
+                horizontal_arrows: true,
+                vertical_arrows: true,
                 escape: true,
                 ..Default::default()
             })
@@ -1111,6 +1318,18 @@ fn row(ui: &mut Ui, height: f32) -> (Rect, Response) {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     (rect.shrink2(vec2(PAD_X - 4.0, 0.0)), response)
+}
+
+/// A tree row with a stable ID, allowing focus to follow keyboard selection
+/// when the visible tree changes after expanding or collapsing a folder.
+fn tree_row(ui: &mut Ui, height: f32, key: String) -> (Rect, Response) {
+    let (full_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let response = ui.interact(
+        full_rect,
+        Id::new(("sidebar-tree-row", key)),
+        Sense::click(),
+    );
+    (full_rect.shrink2(vec2(PAD_X - 4.0, 0.0)), response)
 }
 
 fn paint_row_bg(ui: &Ui, rect: Rect, response: &Response, selected: bool, palette: &Palette) {

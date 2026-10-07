@@ -21,14 +21,14 @@ use scripture_study_core::{
     editor::{self as ops, Caret, SlashQuery},
     history::History,
     inline::{self, MarkKind, DEFAULT_HIGHLIGHT, DEFAULT_UNDERLINE},
-    links, marks,
+    links, marks, scriptures,
     selection::{self, Selection},
     settings::CollapsedOutline,
     Block, BlockKind, Document, NoteMeta,
 };
 
 use crate::citation_form::{self, CitationForm, Outcome};
-use crate::file_menu::FilePicker;
+use crate::file_menu::{FilePicker, MovePicker};
 use crate::find_bar::{self, FindBar};
 use crate::link_menu::{self, LinkForm, LinkMenu, LinkTarget};
 use crate::marks::{BarAction, MarkMenu};
@@ -55,6 +55,13 @@ pub enum Event {
     Run(Action),
     /// Open the note with this id.
     OpenNote(String),
+    /// Open a scripture citation in the reader.
+    OpenScripture(String),
+    /// The current selection was moved into another page.
+    MoveSelection {
+        destination: String,
+        markdown: String,
+    },
 }
 
 enum Op {
@@ -159,12 +166,21 @@ enum Op {
         label: String,
         text: String,
     },
+    /// Replace a scripture citation everywhere it appears in the note.
+    EditScripture {
+        old_label: String,
+        new_label: String,
+        text: String,
+    },
     /// Insert a link to another note. `title` is the visible text.
     InsertNoteLink {
         block: usize,
         at: usize,
         id: String,
         title: String,
+    },
+    MoveSelection {
+        destination: String,
     },
     /// Replace a block's text and select `char..end` (a caret if equal).
     SetText {
@@ -198,6 +214,55 @@ struct LinkPress {
     target: Target,
     /// Whether the block was being edited when pressed.
     editing: bool,
+}
+
+struct ScriptureCitationMenu {
+    reference: String,
+    pos: Pos2,
+    just_opened: bool,
+}
+
+impl ScriptureCitationMenu {
+    fn new(reference: String, pos: Pos2) -> Self {
+        Self {
+            reference,
+            pos,
+            just_opened: true,
+        }
+    }
+
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        palette: &Palette,
+    ) -> (Option<ScriptureCitationAction>, bool) {
+        let (chosen, open) = crate::menu::menu_at(
+            ctx,
+            Id::new("scripture-citation-menu"),
+            self.pos,
+            palette,
+            std::mem::take(&mut self.just_opened),
+            |ui| {
+                if crate::menu::Item::new("Edit")
+                    .icon(crate::icons::pencil)
+                    .show(ui, palette)
+                {
+                    return Some(ScriptureCitationAction::Edit);
+                }
+                crate::menu::Item::new("Go to Scripture")
+                    .icon(crate::icons::quote)
+                    .show(ui, palette)
+                    .then_some(ScriptureCitationAction::GoTo)
+            },
+        );
+        let stays_open = open && chosen.is_none();
+        (chosen, stays_open)
+    }
+}
+
+enum ScriptureCitationAction {
+    Edit,
+    GoTo,
 }
 
 pub struct Editor {
@@ -238,6 +303,8 @@ pub struct Editor {
     citation_form: Option<CitationForm>,
     /// The menu for a right-clicked link, while it's open.
     link_menu: Option<LinkMenu>,
+    /// The menu for a right-clicked scripture citation, while it's open.
+    scripture_citation_menu: Option<ScriptureCitationMenu>,
     /// The menu for a right-clicked misspelling, while it's open.
     spell_menu: Option<SpellMenu>,
     /// Highlight and underline colors for the right-clicked text.
@@ -270,6 +337,7 @@ pub struct Editor {
     scripture_picker: Option<ScripturePicker>,
     /// The document picker opened by `/file-link`.
     file_picker: Option<FilePicker>,
+    move_picker: Option<MovePicker>,
     /// Where the slash menu was drawn, so the scripture picker opens there.
     menu_anchor: Pos2,
     /// Undo and redo for the whole note.
@@ -307,6 +375,7 @@ impl Editor {
             history: History::new(&doc),
             citation_form: None,
             link_menu: None,
+            scripture_citation_menu: None,
             spell_menu: None,
             mark_menu: None,
             bar_kind: MarkKind::Highlight,
@@ -321,6 +390,7 @@ impl Editor {
             ref_rects: HashMap::new(),
             scripture_picker: None,
             file_picker: None,
+            move_picker: None,
             menu_anchor: Pos2::ZERO,
             separate_change: false,
             doc,
@@ -602,7 +672,10 @@ impl Editor {
             self.highlighted_citation = None;
         }
         // A picker search owns the keyboard while it's open.
-        if self.scripture_picker.is_some() || self.file_picker.is_some() {
+        if self.scripture_picker.is_some()
+            || self.file_picker.is_some()
+            || self.move_picker.is_some()
+        {
             self.pending_caret = None;
             self.pending_selection_end = None;
             for i in 0..self.doc.blocks.len() {
@@ -628,7 +701,10 @@ impl Editor {
             self.pending_selection_end = pending_end;
         }
         let mut op = self.selection_input(ui);
-        if self.selection.is_some() {
+        let picker_open = self.scripture_picker.is_some()
+            || self.file_picker.is_some()
+            || self.move_picker.is_some();
+        if self.selection.is_some() && !picker_open {
             op = op.or_else(|| self.selection_keys(ui));
             // The document selection owns the keyboard; no block keeps a caret.
             for i in 0..self.doc.blocks.len() {
@@ -929,10 +1005,17 @@ impl Editor {
                             let word = text[range.clone()].to_string();
                             (range, word)
                         });
+                        let citation = citations::ref_at(text, ops::byte_to_char(text, byte))
+                            .filter(|id| {
+                                self.doc.citations.iter().any(|c| &c.id == id)
+                                    && scriptures::find_verses(id)
+                                        .iter()
+                                        .any(|hit| hit.label == *id)
+                            });
                         let link = LinkTarget::at(i, text, byte);
-                        Some((p, byte, word, link))
+                        Some((p, byte, word, link, citation))
                     });
-                if let Some((pos, byte, word, link)) = hit {
+                if let Some((pos, byte, word, link, citation)) = hit {
                     let doc_sel = self.selection.filter(|s| !s.is_empty());
                     let field = selection.filter(|(start, end)| start != end);
                     // A selection is what gets annotated. Otherwise a misspelling
@@ -940,6 +1023,11 @@ impl Editor {
                     if doc_sel.is_some() || field.is_some() {
                         let (start, end) = field.unwrap_or((0, 0));
                         self.mark_menu = Some(MarkMenu::new(doc_sel.is_some(), i, start, end, pos));
+                        self.spell_menu = None;
+                        self.link_menu = None;
+                    } else if let Some(reference) = citation {
+                        self.scripture_citation_menu =
+                            Some(ScriptureCitationMenu::new(reference, pos));
                         self.spell_menu = None;
                         self.link_menu = None;
                     } else if let Some((range, word)) = word {
@@ -1066,6 +1154,23 @@ impl Editor {
                 if let Some(next) = self.apply_link_choice(choice, target, ui) {
                     op = Some(next);
                 }
+            }
+        }
+        if let Some(mut citation_menu) = self.scripture_citation_menu.take() {
+            let reference = citation_menu.reference.clone();
+            let position = citation_menu.pos;
+            let (chosen, open) = citation_menu.show(ui.ctx(), &palette);
+            if open {
+                self.scripture_citation_menu = Some(citation_menu);
+            }
+            match chosen {
+                Some(ScriptureCitationAction::Edit) => {
+                    self.scripture_picker = Some(ScripturePicker::for_edit(reference, position));
+                }
+                Some(ScriptureCitationAction::GoTo) => {
+                    events.push(Event::OpenScripture(reference));
+                }
+                None => {}
             }
         }
         let spell_still = self
@@ -1260,6 +1365,27 @@ impl Editor {
                             end,
                         });
                     }
+                    BarAction::Copy => {
+                        if let Some(sel) = self.selection {
+                            ui.ctx().copy_text(selection::to_markdown(&self.doc, &sel));
+                        }
+                    }
+                    BarAction::MoveTo => {
+                        // Clicking the bar can return focus to the text field,
+                        // which clears the document-level selection. Rebuild
+                        // it from the range the bar was drawn for so the
+                        // picker still has the text to move.
+                        if !selection {
+                            self.selection = Some(Selection::new(
+                                Caret { block, char: start },
+                                Caret { block, char: end },
+                            ));
+                        }
+                        self.move_picker = Some(MovePicker::new(Pos2::new(
+                            rect.left(),
+                            rect.bottom() + 12.0,
+                        )));
+                    }
                 }
             }
         }
@@ -1362,12 +1488,20 @@ impl Editor {
                 }
                 crate::scripture_menu::Outcome::Insert(hit) => {
                     let picker = self.scripture_picker.take().expect("picker");
-                    if let Some(event) = self.apply(Op::InsertScripture {
-                        block: picker.block,
-                        at: picker.at,
-                        label: hit.label,
-                        text: hit.text,
-                    }) {
+                    let op = match picker.editing {
+                        Some(old_label) => Op::EditScripture {
+                            old_label,
+                            new_label: hit.label,
+                            text: hit.text,
+                        },
+                        None => Op::InsertScripture {
+                            block: picker.block,
+                            at: picker.at,
+                            label: hit.label,
+                            text: hit.text,
+                        },
+                    };
+                    if let Some(event) = self.apply(op) {
                         events.push(event);
                     }
                     if let Some(caret) = self.pending_caret.take() {
@@ -1400,6 +1534,26 @@ impl Editor {
                     if let Some(caret) = self.pending_caret.take() {
                         self.caret_after_form = Some((caret, 1));
                     }
+                }
+                crate::file_menu::Outcome::Move(_) => unreachable!("link picker cannot move"),
+            }
+        }
+        if let Some(picker) = &mut self.move_picker {
+            match picker.show(ui, &self.note_id, notes, &palette) {
+                crate::file_menu::Outcome::Open => {}
+                crate::file_menu::Outcome::Cancel => self.move_picker = None,
+                crate::file_menu::Outcome::Move(destination) => {
+                    self.move_picker = None;
+                    if self.selection.is_some() {
+                        if let Some(event) = self.apply(Op::MoveSelection {
+                            destination: destination.id,
+                        }) {
+                            events.push(event);
+                        }
+                    }
+                }
+                crate::file_menu::Outcome::Insert(_) => {
+                    unreachable!("move picker inserts no links")
                 }
             }
         }
@@ -2236,24 +2390,31 @@ impl Editor {
 
         const NUMBER_WIDTH: f32 = 30.0;
         let citations = self.doc.citations.clone();
+        // Keep every citation value on the same vertical line. The previous
+        // per-row measurement made long scripture references push only their
+        // own value to the right.
+        let label_width = citations
+            .iter()
+            .map(|citation| {
+                if citations::is_numbered(&citation.id) {
+                    NUMBER_WIDTH
+                } else {
+                    ui.painter()
+                        .layout_no_wrap(
+                            citation.id.clone(),
+                            FontId::proportional(13.0),
+                            palette.faint,
+                        )
+                        .size()
+                        .x
+                        + 14.0
+                }
+            })
+            .max_by(f32::total_cmp)
+            .unwrap_or(NUMBER_WIDTH)
+            .clamp(NUMBER_WIDTH, (width * 0.46).max(NUMBER_WIDTH));
         for citation in &citations {
-            let width = ui.available_width();
             let numbered = citations::is_numbered(&citation.id);
-            let label_width = if numbered {
-                NUMBER_WIDTH
-            } else {
-                let measured = ui
-                    .painter()
-                    .layout_no_wrap(
-                        citation.id.clone(),
-                        FontId::proportional(13.0),
-                        palette.faint,
-                    )
-                    .size()
-                    .x
-                    + 14.0;
-                measured.clamp(NUMBER_WIDTH, (width * 0.46).max(NUMBER_WIDTH))
-            };
             let galley = theme::layout(
                 ui,
                 &citation.text,
@@ -2293,6 +2454,7 @@ impl Editor {
             }
 
             let text_pos = rect.min + vec2(label_width, 4.0);
+            let text_rect = Rect::from_min_size(text_pos, galley.size());
             let number_rect =
                 Rect::from_min_size(rect.min, vec2((label_width - 6.0).max(1.0), 26.0));
             if numbered {
@@ -2312,6 +2474,22 @@ impl Editor {
                     palette.faint,
                 );
             }
+            // A selectable Label is needed here instead of painting the
+            // galley directly: egui's label selection machinery can then
+            // handle drag-to-highlight and copy for citation text.
+            let text_response =
+                ui.put(text_rect, egui::Label::new(galley.clone()).selectable(true));
+            if (response.secondary_clicked() || text_response.secondary_clicked())
+                && scriptures::find_verses(&citation.id)
+                    .iter()
+                    .any(|hit| hit.label == citation.id)
+            {
+                let position = ui
+                    .input(|input| input.pointer.interact_pos())
+                    .unwrap_or(rect.right_bottom());
+                self.scripture_citation_menu =
+                    Some(ScriptureCitationMenu::new(citation.id.clone(), position));
+            }
             let on_number = ui.rect_contains_pointer(number_rect);
             let url = ui
                 .input(|i| i.pointer.hover_pos())
@@ -2320,9 +2498,7 @@ impl Editor {
             if on_number || url.is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            ui.painter().galley(text_pos, galley, palette.text);
-
-            if response.clicked() {
+            if response.clicked() || text_response.clicked() {
                 if let Some(url) = url {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                 } else if on_number {
@@ -2796,6 +2972,26 @@ impl Editor {
                 let at = at.min(doc.blocks[block].text.chars().count());
                 Some(citations::insert_labeled(doc, block, at, &label, &text))
             }
+            Op::EditScripture {
+                old_label,
+                new_label,
+                text,
+            } => {
+                let citation = doc.citations.iter_mut().find(|c| c.id == old_label)?;
+                citation.id = new_label.clone();
+                citation.text = text;
+                for block in &mut doc.blocks {
+                    let refs = citations::refs(&block.text)
+                        .into_iter()
+                        .filter(|reference| reference.id == old_label)
+                        .map(|reference| reference.range)
+                        .collect::<Vec<_>>();
+                    for range in refs.into_iter().rev() {
+                        block.text.replace_range(range, &format!("[^{new_label}]"));
+                    }
+                }
+                None
+            }
             Op::InsertNoteLink {
                 block,
                 at,
@@ -2890,6 +3086,15 @@ impl Editor {
                 event = None;
                 self.selection = Some(sel);
                 None
+            }
+            Op::MoveSelection { destination } => {
+                let sel = self.selection.take()?;
+                let markdown = selection::to_markdown(doc, &sel);
+                event = Some(Event::MoveSelection {
+                    destination,
+                    markdown,
+                });
+                Some(selection::delete(doc, &sel))
             }
             Op::DeleteSelection => {
                 let sel = self.selection.take()?;

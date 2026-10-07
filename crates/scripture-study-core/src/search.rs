@@ -49,7 +49,7 @@ const SNIPPET_CHARS: usize = 80;
 
 /// Notes containing every word of `query` (case-insensitive), best first:
 /// title matches outrank body matches, then newer notes win ties.
-/// An empty query returns every note, newest first.
+/// An empty query returns every note in case-insensitive title order.
 pub fn search(notes: &[IndexedNote], query: &str) -> Vec<SearchHit> {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     let mut hits: Vec<(i32, SystemTime, SearchHit)> = notes
@@ -82,7 +82,16 @@ pub fn search(notes: &[IndexedNote], query: &str) -> Vec<SearchHit> {
             ))
         })
         .collect();
-    hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    if words.is_empty() {
+        hits.sort_by(|a, b| {
+            a.2.title
+                .to_lowercase()
+                .cmp(&b.2.title.to_lowercase())
+                .then(a.2.id.cmp(&b.2.id))
+        });
+    } else {
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    }
     hits.into_iter().map(|(_, _, hit)| hit).collect()
 }
 
@@ -159,8 +168,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_lists_newest_first() {
-        assert_eq!(ids(&search(&notes(), "  ")), ["ideas", "trip", "groceries"]);
+    fn empty_query_lists_titles_alphabetically() {
+        assert_eq!(ids(&search(&notes(), "  ")), ["groceries", "ideas", "trip"]);
         assert!(search(&notes(), "").iter().all(|h| h.snippet.is_none()));
     }
 

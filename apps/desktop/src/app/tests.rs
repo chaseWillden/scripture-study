@@ -3,11 +3,12 @@
 //! Set `NOTES_SNAPSHOT_DIR` to also render PNG screenshots of each scenario.
 
 use std::fs;
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use eframe::egui::{self, Key};
 use egui_kittest::{kittest::Queryable, Harness};
-use scripture_study_core::BlockKind;
+use scripture_study_core::{scriptures, BlockKind};
 
 use super::ScriptureStudyApp;
 
@@ -31,6 +32,13 @@ impl Fixture {
     }
 
     fn with_notes_sized(size: egui::Vec2, notes: &[(&str, &str)]) -> Self {
+        let mut fixture = Self::with_notes_sized_default(size, notes);
+        fixture.harness.state_mut().sidebar.view = crate::sidebar::View::Recent;
+        fixture.harness.run();
+        fixture
+    }
+
+    fn with_notes_sized_default(size: egui::Vec2, notes: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let start = SystemTime::now() - Duration::from_secs(3 * 86_400);
         for (n, (id, markdown)) in notes.iter().enumerate() {
@@ -81,6 +89,30 @@ impl Fixture {
         self.harness.run();
     }
 
+    fn wait_for_scripture_index(&mut self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while scriptures::search_if_ready("").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scripture index did not load"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.harness.run();
+    }
+
+    fn wait_for_scripture_result(&mut self, label: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while self.harness.query_by_label(label).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing scripture result: {label}"
+            );
+            thread::sleep(Duration::from_millis(1));
+            self.harness.run();
+        }
+    }
+
     fn shortcut_mods(&mut self, modifiers: egui::Modifiers, key: Key) {
         self.harness.key_press_modifiers(modifiers, key);
         self.harness.run();
@@ -129,6 +161,12 @@ impl Fixture {
             .save(std::path::Path::new(&dir).join(format!("{name}.png")))
             .unwrap();
     }
+}
+
+#[test]
+fn default_sidebar_view_is_folders() {
+    let f = Fixture::with_notes_sized_default(egui::vec2(1000.0, 640.0), &[]);
+    assert_eq!(f.app().sidebar.view, crate::sidebar::View::Folders);
 }
 
 #[test]
@@ -724,6 +762,87 @@ fn organize_view_shows_folders_that_expand() {
 }
 
 #[test]
+fn folder_view_displays_numbered_notes_in_numeric_then_alphabetical_order() {
+    let mut f = Fixture::with_notes_sized_default(
+        egui::vec2(1000.0, 640.0),
+        &[
+            ("Prophecies/ten", "# 10 - Laman\n"),
+            ("Prophecies/two-z", "# 2 - Zebra\n"),
+            ("Prophecies/one", "# 1 - Destruction\n"),
+            ("Prophecies/two-a", "# 2 - Apple\n"),
+            ("Prophecies/summary", "# 1 Nephi Prophecies\n"),
+            ("Prophecies/plain", "# Apple\n"),
+        ],
+    );
+    f.click("Prophecies");
+    let titles = [
+        "1 - Destruction",
+        "1 Nephi Prophecies",
+        "2 - Apple",
+        "2 - Zebra",
+        "10 - Laman",
+        "Apple",
+    ];
+    let positions: Vec<_> = titles
+        .iter()
+        .map(|title| f.harness.get_by_label(title).rect().top())
+        .collect();
+    assert!(
+        positions.windows(2).all(|rows| rows[0] < rows[1]),
+        "notes should appear in numeric then alphabetical order: {positions:?}"
+    );
+    f.click("2 - Apple");
+    assert_eq!(f.app().current, "Prophecies/two-a");
+}
+
+#[test]
+fn folder_tree_keyboard_navigation_opens_a_note() {
+    let mut f = organized_notes();
+    f.click("Work");
+
+    // Work is selected by the click; the next visible row is its note.
+    f.press(Key::ArrowDown);
+    f.press(Key::ArrowUp);
+
+    // Left collapses the selected folder; right opens it again and moves to
+    // its first child when pressed a second time.
+    f.press(Key::ArrowLeft);
+    assert!(f.harness.query_by_label("Plan").is_none());
+    f.press(Key::ArrowRight);
+    f.press(Key::ArrowRight);
+    // The headless harness applies row focus on the following frame.
+    f.harness
+        .state_mut()
+        .sidebar
+        .request_tree_focus("note:Work/plan".into());
+    f.press(Key::Enter);
+    assert_eq!(f.app().current, "Work/plan");
+}
+
+#[test]
+fn document_enter_does_not_toggle_the_selected_folder() {
+    let mut f = organized_notes();
+    f.click("Work");
+
+    // Move keyboard focus to the document while the folder remains selected.
+    f.harness.get_all_by_value("Ideas").next().unwrap().click();
+    f.press(Key::Enter);
+
+    assert!(f.harness.query_by_label("Plan").is_some());
+}
+
+#[test]
+fn document_cursor_does_not_toggle_folders() {
+    let mut f = organized_notes();
+    f.click("Work");
+    f.click("Plan");
+
+    f.shortcut_mods(egui::Modifiers::COMMAND, Key::ArrowLeft);
+    f.shortcut_mods(egui::Modifiers::COMMAND, Key::ArrowRight);
+    assert!(f.harness.query_by_label("Plan").is_some());
+}
+
+#[test]
 fn create_a_folder_from_the_header_button() {
     let mut f = organized_notes();
     f.click("New folder");
@@ -731,6 +850,30 @@ fn create_a_folder_from_the_header_button() {
     f.press(Key::Enter);
     assert!(f.dir.path().join("Projects").is_dir());
     assert!(f.harness.query_by_label("Projects").is_some());
+}
+
+#[test]
+fn blank_folder_area_opens_creation_menu() {
+    let mut f = organized_notes();
+    let row = f.harness.get_by_label("Work").rect();
+    let pos = egui::pos2(row.left() + 20.0, row.bottom() + 100.0);
+    f.harness.hover_at(pos);
+    f.harness.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Secondary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    f.harness.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Secondary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    f.harness.run();
+
+    assert!(f.harness.get_all_by_label("New folder").count() >= 2);
+    assert!(f.harness.query_by_label("New document").is_some());
 }
 
 #[test]
@@ -1223,6 +1366,25 @@ fn double_clicking_a_note_renames_it() {
 }
 
 #[test]
+fn renaming_a_note_keeps_focus_for_cursor_navigation() {
+    let mut f = three_notes();
+    f.shortcut(Key::R);
+
+    // The title starts selected. Move to the end, then use a word-navigation
+    // shortcut; both must be handled by the text field instead of ending the
+    // rename.
+    f.press(Key::ArrowRight);
+    f.shortcut_mods(egui::Modifiers::ALT, Key::ArrowLeft);
+    f.type_text("Big ");
+    f.press(Key::Enter);
+
+    assert!(f.app().sidebar.renaming_note().is_none());
+    assert!(fs::read_to_string(note_file(&f, "ideas"))
+        .unwrap()
+        .starts_with("# Big Ideas\n"));
+}
+
+#[test]
 fn rename_from_the_menu_and_escape_cancels() {
     let mut f = three_notes();
     f.harness.get_by_label("Trip plan").click_secondary();
@@ -1518,6 +1680,7 @@ fn clicking_a_link_opens_it_when_not_editing() {
         });
         f.harness.run();
     }
+    f.harness.run();
 
     let text = block_rect(&f, "See [the docs](https://docs.rs) now");
     // "See " is about 30pt wide at 16pt; aim inside "the docs".
@@ -2204,6 +2367,8 @@ fn slash_scripture_cites_the_reference_instead_of_a_number() {
     f.press(Key::Enter);
     f.snapshot("scripture_picker");
     f.type_text("Ether 2:1-4");
+    f.wait_for_scripture_index();
+    f.wait_for_scripture_result("Ether 2:1-4");
     f.snapshot("scripture_picker_results");
     f.harness.ctx.set_theme(egui::Theme::Light);
     f.harness.run();
@@ -2231,6 +2396,7 @@ fn slash_scripture_cites_the_reference_instead_of_a_number() {
     f.type_text(" /scripture");
     f.press(Key::Enter);
     f.type_text("1 Nephi 1:11");
+    f.wait_for_scripture_result("1 Nephi 1:11");
     f.press(Key::Enter);
     assert_eq!(
         f.texts(),
@@ -2247,6 +2413,46 @@ fn slash_scripture_cites_the_reference_instead_of_a_number() {
         "{}",
         f.app().editor.doc.citations[1].text
     );
+}
+
+#[test]
+fn slash_scripture_filters_each_keystroke_without_collapsing_the_popup() {
+    let mut f = Fixture::new();
+    f.wait_for_scripture_index();
+    f.type_text("Read /scripture");
+    f.press(Key::Enter);
+    f.type_text("1 N");
+    assert!(f.harness.query_by_label("1 Nephi 1:1").is_some());
+    f.snapshot("scripture_live_book");
+    let row = f.harness.get_by_label("1 Nephi 1:1").rect();
+    let mut slowest_frame = Duration::ZERO;
+    for letter in "ephi 1:1".chars() {
+        let start = std::time::Instant::now();
+        f.type_text(&letter.to_string());
+        slowest_frame = slowest_frame.max(start.elapsed());
+        // Results exist in the same input frame; no worker wait is needed.
+        let first = f.harness.get_by_label("1 Nephi 1:1").rect();
+        assert!((first.top() - row.top()).abs() < 1.0);
+    }
+    f.type_text("1");
+    assert!(f.harness.query_by_label("1 Nephi 1:11").is_some());
+    assert!((f.harness.get_by_label("1 Nephi 1:11").rect().top() - row.top()).abs() < 1.0);
+    f.snapshot("scripture_live_verse");
+    eprintln!("Rapid reference typing: slowest harness update {slowest_frame:?}");
+    f.press(Key::Enter);
+    assert_eq!(f.texts(), ["Read [^1 Nephi 1:11]"]);
+}
+
+#[test]
+fn slash_scripture_word_search_replaces_results_and_inserts_the_latest_match() {
+    let mut f = Fixture::new();
+    f.wait_for_scripture_index();
+    f.type_text("Read /scripture");
+    f.press(Key::Enter);
+    f.type_text("in the beginning god created");
+    f.wait_for_scripture_result("Genesis 1:1");
+    f.press(Key::Enter);
+    assert_eq!(f.texts(), ["Read [^Genesis 1:1]"]);
 }
 
 #[test]
@@ -2462,6 +2668,30 @@ fn clicking_the_citations_header_opens_and_closes_the_list() {
         f.harness.query_by_label("Citation 1").is_none(),
         "clicking the header again closes the list"
     );
+}
+
+#[test]
+fn citation_values_can_be_selected_and_copied() {
+    let mut f = Fixture::with_note(
+        "Faith precedes the miracle[^1].\n\n[^1]: Tablets are preserved in the archive.\n",
+    );
+    f.harness.run();
+    f.click("Citations");
+
+    let row = f.harness.get_by_label("Citation 1").rect();
+    let from = row.left_center() + egui::vec2(34.0, 0.0);
+    let to = from + egui::vec2(70.0, 0.0);
+    f.harness.hover_at(from);
+    f.harness.run();
+    f.harness.drag_at(from);
+    f.harness.run();
+    f.harness.hover_at(to);
+    f.harness.run();
+    f.harness.drop_at(to);
+    f.harness.run();
+
+    let copied = clipboard_after(&mut f, egui::Event::Copy).expect("citation selection");
+    assert!(copied.starts_with("Tablets ar"), "{copied:?}");
 }
 
 fn click_with(f: &mut Fixture, pos: egui::Pos2, button: egui::PointerButton) {
@@ -2689,6 +2919,107 @@ fn scriptures_page_opens_a_book_then_its_chapter() {
 }
 
 #[test]
+fn right_clicking_a_verse_offers_its_reference() {
+    let mut f = Fixture::with_note("# Note\n");
+    f.click("Scriptures");
+    f.click("Genesis");
+    f.click("Chapter 1");
+
+    let verse = f
+        .harness
+        .get_by_label("In the beginning God created the heaven and the earth.")
+        .rect()
+        .center();
+    for pressed in [true, false] {
+        f.harness.event(egui::Event::PointerButton {
+            pos: verse,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        f.harness.run();
+    }
+    assert!(f.harness.query_by_label("Copy reference").is_some());
+
+    f.harness.get_by_label("Copy reference").click();
+    f.harness.step();
+    let copied =
+        f.harness
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                _ => None,
+            });
+    assert_eq!(copied, Some("Genesis 1:1"));
+    f.harness.run();
+    assert!(f.harness.query_by_label("Copy reference").is_none());
+}
+
+#[test]
+fn right_clicking_a_scripture_citation_opens_and_highlights_it() {
+    let mut f = Fixture::with_note(
+        "Read this[^Ether 2:1-4].\n\n[^Ether 2:1-4]: And it came to pass that the Lord spoke unto Jared.\n",
+    );
+    let citation = f
+        .app()
+        .editor
+        .citation_number_rect("Ether 2:1-4")
+        .expect("scripture citation drawn")
+        .center();
+    click_with(&mut f, citation, egui::PointerButton::Secondary);
+    assert!(f.harness.query_by_label("Go to Scripture").is_some());
+
+    f.click("Go to Scripture");
+
+    assert!(f.app().scriptures.is_open());
+    assert_eq!(f.app().scriptures.title().as_deref(), Some("Ether 2"));
+    assert_eq!(f.app().scriptures.highlighted_verse_range(), Some((1, 4)));
+}
+
+#[test]
+fn right_clicking_a_scripture_citation_in_the_list_offers_navigation() {
+    let mut f = Fixture::with_note(
+        "Read this[^Ether 2:1-4].\n\n[^Ether 2:1-4]: And it came to pass that the Lord spoke unto Jared.\n",
+    );
+    f.click("Citations");
+    let citation = f
+        .harness
+        .get_by_label("Citation Ether 2:1-4")
+        .rect()
+        .center();
+    click_with(&mut f, citation, egui::PointerButton::Secondary);
+
+    assert!(f.harness.query_by_label("Go to Scripture").is_some());
+}
+
+#[test]
+fn editing_a_scripture_citation_replaces_its_reference_and_text() {
+    let mut f = Fixture::with_note(
+        "Read this[^Ether 2:1-4] twice[^Ether 2:1-4].\n\n[^Ether 2:1-4]: And it came to pass that the Lord spoke unto Jared.\n",
+    );
+    f.click("Citations");
+    let citation = f
+        .harness
+        .get_by_label("Citation Ether 2:1-4")
+        .rect()
+        .center();
+    click_with(&mut f, citation, egui::PointerButton::Secondary);
+    f.click("Edit");
+
+    f.shortcut(Key::A);
+    f.type_text("1 Nephi 1:1");
+    f.wait_for_scripture_index();
+    f.press(Key::Enter);
+
+    assert_eq!(f.texts(), ["Read this[^1 Nephi 1:1] twice[^1 Nephi 1:1]."]);
+    assert_eq!(f.app().editor.doc.citations[0].id, "1 Nephi 1:1");
+    assert!(f.app().editor.doc.citations[0].text.contains("Nephi"));
+}
+
+#[test]
 fn cmd_f_finds_in_the_open_chapter() {
     let mut f = Fixture::with_note("# Note\n\nKeep me.\n");
     f.click("Scriptures");
@@ -2774,6 +3105,41 @@ fn scriptures_filter_and_search() {
         .query_by_label("In the beginning God created the heaven and the earth.")
         .is_some());
     assert_eq!(f.texts(), ["Note", "Keep me."]);
+}
+
+#[test]
+fn scripture_search_selects_and_reveals_a_verse_range() {
+    let mut f = Fixture::with_note("# Note\n\nKeep me.\n");
+    f.click("Scriptures");
+    f.harness
+        .get_by(|node| node.placeholder() == Some("Search scriptures"))
+        .click();
+    f.harness.run();
+    f.type_text("Ether 2:1-4");
+    f.click("Ether 2:1-4");
+
+    assert_eq!(f.app().scriptures.highlighted_verse_range(), Some((1, 4)));
+    assert_eq!(f.app().scriptures.title().as_deref(), Some("Ether 2"));
+}
+
+#[test]
+fn scripture_search_keeps_more_than_ten_results_and_mounts_a_page() {
+    let mut f = Fixture::with_note("# Note\n\nKeep me.\n");
+    f.click("Scriptures");
+    f.harness
+        .get_by(|node| node.placeholder() == Some("Search scriptures"))
+        .click();
+    f.harness.run();
+    f.type_text("and the");
+
+    let results = scriptures::find_verses("and the");
+    assert!(results.len() > 10);
+    assert!(f
+        .harness
+        .query_by_label(&format!("Results ({})", results.len()))
+        .is_some());
+    let eleventh = results[10].label.clone();
+    assert!(f.harness.query_by_label(&eleventh).is_some());
 }
 
 #[test]
@@ -2878,4 +3244,37 @@ fn selecting_text_shows_the_highlight_bar() {
 
     f.click_menu_item("Clear");
     assert_eq!(f.texts(), ["hope"]);
+}
+
+#[test]
+fn moving_selected_text_cuts_it_from_source_and_inserts_it_into_destination() {
+    let mut f = Fixture::with_notes(&[
+        ("destination", "# Destination\n\nExisting text.\n"),
+        ("source", "# Source\n\nMove this text.\n"),
+    ]);
+
+    // The caret starts at the end of the source note. Select "Move this text.".
+    for _ in 0..15 {
+        f.shortcut_mods(egui::Modifiers::SHIFT, Key::ArrowLeft);
+    }
+    f.click("Move To");
+    assert!(f.harness.get_all_by_label("Destination").count() >= 2);
+    assert!(selection(&f).is_some());
+    f.press(Key::Enter);
+    assert!(selection(&f).is_none());
+    assert!(f.app().error.is_none(), "{:?}", f.app().error);
+
+    assert_eq!(f.app().current, "destination");
+    assert_eq!(
+        f.texts(),
+        ["Destination", "Existing text.", "Move this text."]
+    );
+
+    let source = fs::read_to_string(f.dir.path().join("source.md")).unwrap();
+    let destination = fs::read_to_string(f.dir.path().join("destination.md")).unwrap();
+    assert!(!source.contains("Move this text."), "{source}");
+    assert!(
+        destination.contains("Existing text.\n\nMove this text."),
+        "{destination}"
+    );
 }

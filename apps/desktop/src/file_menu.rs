@@ -35,6 +35,40 @@ pub struct FilePicker {
     scroll: bool,
 }
 
+/// The selection-bar variant of the document picker. It uses the same search
+/// and document rows as `/file-link`, but returns the chosen destination page.
+pub struct MovePicker {
+    picker: FilePicker,
+}
+
+impl MovePicker {
+    pub fn new(anchor: Pos2) -> Self {
+        Self {
+            picker: FilePicker::new(0, 0, anchor),
+        }
+    }
+
+    pub fn show(
+        &mut self,
+        ui: &Ui,
+        current_id: &str,
+        notes: &[NoteMeta],
+        palette: &Palette,
+    ) -> Outcome {
+        let notes: Vec<NoteMeta> = notes
+            .iter()
+            .filter(|note| note.id != current_id)
+            .cloned()
+            .collect();
+        match self.picker.show(ui, current_id, &notes, palette) {
+            Outcome::Open => Outcome::Open,
+            Outcome::Cancel => Outcome::Cancel,
+            Outcome::Insert(choice) => Outcome::Move(choice),
+            Outcome::Move(choice) => Outcome::Move(choice),
+        }
+    }
+}
+
 /// A note chosen from the picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Choice {
@@ -60,6 +94,7 @@ pub enum Outcome {
     Open,
     Cancel,
     Insert(Choice),
+    Move(Choice),
 }
 
 impl FilePicker {

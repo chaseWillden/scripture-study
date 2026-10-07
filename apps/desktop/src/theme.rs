@@ -184,11 +184,11 @@ pub fn tag_colors(ui: &egui::Ui, name: &str) -> (Color32, Color32) {
 /// Font size, weight, and line height for a block's body text.
 fn block_metrics(kind: &BlockKind) -> (f32, f32, f32) {
     match kind {
-        BlockKind::Heading(1) => (30.0, 700.0, 40.0),
-        BlockKind::Heading(2) => (24.0, 650.0, 32.0),
-        BlockKind::Heading(_) => (19.0, 600.0, 27.0),
-        BlockKind::Code { .. } => (14.0, 400.0, 21.0),
-        _ => (16.0, 400.0, 25.0),
+        BlockKind::Heading(1) => (30.0, 700.0, 35.0),
+        BlockKind::Heading(2) => (24.0, 650.0, 27.0),
+        BlockKind::Heading(_) => (19.0, 600.0, 22.0),
+        BlockKind::Code { .. } => (14.0, 400.0, 17.0),
+        _ => (16.0, 400.0, 20.0),
     }
 }
 

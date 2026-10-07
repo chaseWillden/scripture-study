@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use eframe::egui::{self, pos2, vec2, Frame, Rect, UiBuilder};
 use scripture_study_core::{
     commands::{self, Action, Command},
+    editor::Caret,
     folders::{self, Folder},
     search::IndexedNote,
     settings::NoteSettings,
@@ -85,6 +86,7 @@ pub struct ScriptureStudyApp {
 impl ScriptureStudyApp {
     pub fn new(cc: &eframe::CreationContext<'_>, store: FsStore) -> std::io::Result<Self> {
         theme::install_fonts(&cc.egui_ctx);
+        scripture_study_core::scriptures::warm();
         let notes = store.list()?;
         let current = match notes.first() {
             Some(note) => note.id.clone(),
@@ -305,6 +307,39 @@ impl ScriptureStudyApp {
             .doc
             .title()
             .unwrap_or_else(|| UNTITLED.to_string())
+    }
+
+    fn move_selection(&mut self, destination: String, markdown: String) {
+        // Persist the deletion before creating the destination so the move is
+        // atomic from the user's point of view when the app switches pages.
+        self.save();
+        match self.store.load(&destination).and_then(|mut doc| {
+            if doc.is_blank() {
+                doc = Document::from_markdown(&markdown);
+            } else {
+                let last = doc.blocks.len() - 1;
+                let end = Caret {
+                    block: last,
+                    char: doc.blocks[last].text.chars().count(),
+                };
+                let insert_at = if doc.blocks[last].text.is_empty() {
+                    end
+                } else {
+                    scripture_study_core::editor::split_block(
+                        &mut doc, end.block, end.char, end.char,
+                    );
+                    Caret {
+                        block: end.block + 1,
+                        char: 0,
+                    }
+                };
+                scripture_study_core::selection::insert(&mut doc, insert_at, &markdown);
+            }
+            self.store.save(&destination, &doc)
+        }) {
+            Ok(()) => self.open(destination),
+            Err(e) => self.error = Some(format!("Couldn't move selection: {e}")),
+        }
     }
 
     fn window_title(&self) -> String {
@@ -892,6 +927,15 @@ impl eframe::App for ScriptureStudyApp {
                     if id != self.current {
                         self.open(id);
                     }
+                }
+                Event::OpenScripture(reference) => {
+                    self.scriptures.open_reference(&reference);
+                }
+                Event::MoveSelection {
+                    destination,
+                    markdown,
+                } => {
+                    self.move_selection(destination, markdown);
                 }
             }
         }

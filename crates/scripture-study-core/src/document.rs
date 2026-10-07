@@ -64,6 +64,11 @@ pub struct Block {
 /// The deepest a block can be indented.
 pub const MAX_INDENT: u8 = 8;
 
+/// An HTML comment used to persist an intentional empty editor row. A plain
+/// Markdown blank line is only a paragraph separator, so it cannot survive a
+/// Markdown round trip as an empty block.
+const EMPTY_PARAGRAPH_MARKER: &str = "<!-- scripture-study:blank -->";
+
 impl Block {
     pub fn new(kind: BlockKind, text: impl Into<String>) -> Self {
         Self {
@@ -262,9 +267,26 @@ impl Document {
         // so a nested list starts at 1 again.
         let mut numbers: Vec<usize> = Vec::new();
 
-        for block in &self.blocks {
-            // Empty paragraphs are editing scaffolding; Markdown can't hold them.
+        for (index, block) in self.blocks.iter().enumerate() {
+            // The final empty paragraph is editing scaffolding. Empty rows in
+            // the middle of a note are intentional and need a marker because
+            // a plain Markdown blank line is only a paragraph separator.
             if block.kind == BlockKind::Paragraph && block.text.trim().is_empty() {
+                let has_content_before = self.blocks[..index]
+                    .iter()
+                    .any(|b| b.kind.has_text() && !b.text.trim().is_empty());
+                let has_content_after = self.blocks[index + 1..]
+                    .iter()
+                    .any(|b| b.kind.has_text() && !b.text.trim().is_empty());
+                if has_content_before && has_content_after {
+                    if let Some(prev) = prev {
+                        let same_list = prev.continues_on_enter()
+                            && std::mem::discriminant(prev) == std::mem::discriminant(&block.kind);
+                        out.push_str(if same_list { "\n" } else { "\n\n" });
+                    }
+                    out.push_str(EMPTY_PARAGRAPH_MARKER);
+                    prev = Some(&block.kind);
+                }
                 continue;
             }
             if let Some(prev) = prev {
@@ -342,6 +364,11 @@ impl Document {
             let trimmed = line.trim();
 
             if trimmed.is_empty() {
+                i += 1;
+                continue;
+            }
+            if trimmed == EMPTY_PARAGRAPH_MARKER {
+                blocks.push(Block::paragraph(""));
                 i += 1;
                 continue;
             }
@@ -707,13 +734,23 @@ fn main() {
     }
 
     #[test]
-    fn empty_paragraphs_are_dropped() {
+    fn internal_empty_paragraphs_roundtrip() {
         let doc = Document::new(vec![
             Block::paragraph("a"),
             Block::paragraph(""),
             Block::paragraph("b"),
         ]);
-        assert_eq!(doc.to_markdown(), "a\n\nb\n");
+        assert_eq!(
+            doc.to_markdown(),
+            "a\n\n<!-- scripture-study:blank -->\n\nb\n"
+        );
+        assert_eq!(roundtrip(&doc), doc);
+    }
+
+    #[test]
+    fn trailing_empty_paragraph_is_editing_scaffolding() {
+        let doc = Document::new(vec![Block::paragraph("a"), Block::paragraph("")]);
+        assert_eq!(doc.to_markdown(), "a\n");
     }
 
     #[test]

@@ -120,11 +120,16 @@ pub enum BarAction {
     Apply { kind: MarkKind, color: u32 },
     /// Take highlight and underline off the selection.
     Clear,
+    /// Copy the selected Markdown to the system clipboard.
+    Copy,
+    /// Start moving the selected Markdown to a new page.
+    MoveTo,
 }
 
 const SWATCH: f32 = 34.0;
 const STRIP: f32 = 32.0;
 const BUTTONS: f32 = 52.0;
+const ACTIONS: f32 = 38.0;
 
 /// The bar above a text selection: a strip of colors, then highlight,
 /// underline, and clear. `kind` is the style a color applies. `color` is
@@ -137,7 +142,7 @@ pub fn show_bar(
     color: u32,
 ) -> Option<BarAction> {
     let width = SWATCH * MARK_COLORS.len() as f32;
-    let height = STRIP + BUTTONS;
+    let height = STRIP + BUTTONS + ACTIONS;
     let screen = ctx.content_rect();
     let x = (selection.center().x - width / 2.0).clamp(
         screen.min.x + 8.0,
@@ -179,6 +184,9 @@ pub fn show_bar(
                     if let Some(picked) = style_row(ui, palette, kind, color, width) {
                         action = Some(picked);
                     }
+                    if let Some(picked) = action_row(ui, palette, width) {
+                        action = Some(picked);
+                    }
                 });
             let panel = ui.min_rect();
             let tip_x = selection
@@ -204,6 +212,52 @@ pub fn show_bar(
                 Stroke::NONE,
             ));
         });
+    action
+}
+
+fn action_row(ui: &mut Ui, palette: &Palette, width: f32) -> Option<BarAction> {
+    let mut action = None;
+    let (rect, _) = ui.allocate_exact_size(vec2(width, ACTIONS), Sense::hover());
+    let gap = 4.0;
+    let button_width = (width - gap) / 2.0;
+    for (index, (label, icon, picked)) in [
+        (
+            "Move To",
+            icons::reveal as fn(&egui::Painter, Pos2, Color32),
+            BarAction::MoveTo,
+        ),
+        (
+            "Copy",
+            icons::copy as fn(&egui::Painter, Pos2, Color32),
+            BarAction::Copy,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let left = rect.left() + index as f32 * (button_width + gap);
+        let button = Rect::from_min_size(Pos2::new(left, rect.top()), vec2(button_width, ACTIONS));
+        let response = ui.allocate_rect(button, Sense::click());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+        if response.hovered() {
+            ui.painter().rect_filled(button, 8.0, palette.menu_selected);
+        }
+        icon(
+            ui.painter(),
+            button.left_center() + vec2(14.0, 0.0),
+            palette.faint,
+        );
+        ui.painter().text(
+            button.left_center() + vec2(28.0, 0.0),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(12.0),
+            palette.text,
+        );
+        if response.clicked() {
+            action = Some(picked);
+        }
+    }
     action
 }
 
