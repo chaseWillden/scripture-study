@@ -897,7 +897,7 @@ impl Sidebar {
             expanded,
             palette.faint,
         );
-        icons::folder(ui.painter(), egui::pos2(x + 20.0, y), palette.text);
+        icons::folder(ui.painter(), egui::pos2(x + 24.0, y), palette.text);
         let count = folder.note_count();
         let count = ui.painter().layout_no_wrap(
             if count > 0 {
@@ -908,7 +908,7 @@ impl Sidebar {
             FontId::proportional(12.0),
             palette.faint,
         );
-        let name_left = x + 36.0;
+        let name_left = x + 40.0;
         let name_width = rect.right() - 10.0 - count.size().x - 8.0 - name_left;
         let name = elided(ui, &folder.name, 14.0, palette.text, name_width);
         ui.painter().galley(
@@ -1005,11 +1005,11 @@ impl Sidebar {
         let x = rect.left() + 10.0 + depth as f32 * INDENT;
         icons::folder(
             ui.painter(),
-            egui::pos2(x + 20.0, rect.center().y),
+            egui::pos2(x + 24.0, rect.center().y),
             palette.text,
         );
         let field = Rect::from_min_max(
-            egui::pos2(x + 36.0, rect.top()),
+            egui::pos2(x + 40.0, rect.top()),
             egui::pos2(rect.right() - 8.0, rect.bottom()),
         );
 
@@ -1087,7 +1087,7 @@ impl Sidebar {
             note.title.as_str()
         };
         let (rect, row) = tree_row(ui, ROW_HEIGHT, TreeItem::note_key(&note.id));
-        let x = rect.left() + 10.0 + depth as f32 * INDENT + 14.0;
+        let x = rect.left() + 10.0 + depth as f32 * INDENT + 18.0;
         let y = rect.center().y;
 
         if self.is_renaming(&note.id) {
