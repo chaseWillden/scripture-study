@@ -1,6 +1,6 @@
 //! The properties row at the top of a note: colored tag chips, people,
-//! custom fields, and when the note was created and last edited, all on one
-//! compact line.
+//! custom fields, when the note was created and last edited, and whether
+//! it's synced, all on one compact line.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,6 +10,7 @@ use eframe::egui::{
 };
 use scripture_study_core::properties::{self, Properties};
 
+use crate::google_drive::NoteSync;
 use crate::icons;
 use crate::theme::{self, Palette};
 
@@ -23,6 +24,8 @@ const FIELD_MARGIN_Y: f32 = 2.0;
 pub struct NoteTimes {
     pub created: SystemTime,
     pub updated: SystemTime,
+    /// Shown beside the dates while a connector is syncing notes.
+    pub sync: Option<NoteSync>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -81,7 +84,29 @@ impl MetaEditor {
         let dates = ui
             .painter()
             .layout_no_wrap(short, FontId::proportional(12.5), palette.faint);
-        let dates_w = dates.size().x + 20.0;
+        let badge = times.sync.as_ref().map(|sync| {
+            let (short, _, _) = sync_texts(sync);
+            let galley = ui.painter().layout_no_wrap(
+                short.to_string(),
+                FontId::proportional(12.5),
+                palette.faint,
+            );
+            // Room for the widest state, so a change of state doesn't
+            // move the dates. Icon, text, and a gap before the dates.
+            let widest = ui
+                .painter()
+                .layout_no_wrap(
+                    sync_texts(&NoteSync::Pending).0.to_string(),
+                    FontId::proportional(12.5),
+                    palette.faint,
+                )
+                .size()
+                .x;
+            let width = 20.0 + widest.max(galley.size().x) + 14.0;
+            (galley, width)
+        });
+        let badge_w = badge.as_ref().map_or(0.0, |(_, w)| *w);
+        let dates_w = dates.size().x + 20.0 + badge_w;
         // In a narrow window the dates get their own line above the rest,
         // instead of squeezing (or overlapping) the tags.
         let stacked = width - dates_w - GROUP_GAP < 260.0;
@@ -138,6 +163,32 @@ impl MetaEditor {
                 changed |= self.name_field(ui, properties, palette, note_id);
             },
         );
+
+        let (badge_rect, dates_rect) =
+            dates_rect.split_left_right_at_x(dates_rect.left() + badge_w);
+        if let (Some((galley, _)), Some(sync)) = (badge, &times.sync) {
+            let (_, label, detail) = sync_texts(sync);
+            let response = ui.interact(badge_rect, Id::new(("meta-sync", note_id)), Sense::hover());
+            response
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
+            let (icon, text) = match sync {
+                NoteSync::Synced | NoteSync::Pending => (palette.faint, palette.faint),
+                NoteSync::Syncing => (palette.accent, palette.faint),
+                NoteSync::Failed(_) => (ERROR, ERROR),
+            };
+            icons::cloud(
+                ui.painter(),
+                badge_rect.left_center() + vec2(8.0, 0.0),
+                icon,
+                *sync == NoteSync::Synced,
+            );
+            let pos = pos2(
+                badge_rect.left() + 20.0,
+                badge_rect.center().y - galley.size().y / 2.0,
+            );
+            ui.painter().galley(pos, galley, text);
+            response.on_hover_text(detail);
+        }
 
         let dates_response =
             ui.interact(dates_rect, Id::new(("meta-dates", note_id)), Sense::hover());
@@ -590,6 +641,34 @@ fn text_width(ui: &Ui, text: &str) -> f32 {
         .layout_no_wrap(text.to_string(), FontId::proportional(FONT), Color32::WHITE)
         .size()
         .x
+}
+
+const ERROR: Color32 = Color32::from_rgb(0xD4, 0x4C, 0x47);
+
+/// (what the row shows, its accessible name, the hover explanation).
+fn sync_texts(sync: &NoteSync) -> (&'static str, &'static str, String) {
+    match sync {
+        NoteSync::Synced => (
+            "Synced",
+            "Synced to Google Drive",
+            "Google Drive has the latest version of this note.".into(),
+        ),
+        NoteSync::Syncing => (
+            "Syncing",
+            "Syncing to Google Drive",
+            "Sending this note to Google Drive…".into(),
+        ),
+        NoteSync::Pending => (
+            "Not synced",
+            "Not synced to Google Drive",
+            "Changes to this note go to Google Drive a few seconds after they're saved.".into(),
+        ),
+        NoteSync::Failed(error) => (
+            "Not synced",
+            "Not synced to Google Drive",
+            format!("Couldn't sync to Google Drive: {error}"),
+        ),
+    }
 }
 
 /// ("Created Sep 28 · Edited 3:53 PM", the same with full dates).

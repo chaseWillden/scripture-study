@@ -167,6 +167,37 @@ pub fn hidden_pairs(text: &str) -> Vec<[Range<usize>; 2]> {
     pairs
 }
 
+/// `text[range]` with highlight and underline tags removed. `range` is a
+/// byte range on character boundaries. A range that begins or ends inside a
+/// tag drops the rest of that tag, and the words stay. Other Markdown,
+/// including `**bold**` and citation marks, is left as it is.
+pub fn without_mark_tags(text: &str, range: Range<usize>) -> String {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len()).max(start);
+    let mut tags = Vec::new();
+    for mark in marks(text) {
+        tags.push(mark.full.start..mark.content.start);
+        tags.push(mark.content.end..mark.full.end);
+    }
+    let mut out = String::new();
+    let mut i = start;
+    while i < end {
+        if let Some(tag) = tags.iter().find(|tag| tag.start <= i && i < tag.end) {
+            i = tag.end.min(end);
+            continue;
+        }
+        let next = tags
+            .iter()
+            .map(|tag| tag.start)
+            .filter(|at| *at > i && *at < end)
+            .min()
+            .unwrap_or(end);
+        out.push_str(&text[i..next]);
+        i = next;
+    }
+    out
+}
+
 /// Every highlight and underline in `text`, outer marks before the ones
 /// inside them. Tags inside inline code are left as code.
 pub fn marks(text: &str) -> Vec<Mark> {
@@ -793,6 +824,13 @@ mod tests {
             ]
         );
         assert_eq!(plain_text(text), "see this word and that");
+        assert_eq!(
+            without_mark_tags(text, 0..text.len()),
+            "see this **word** and that"
+        );
+        let inside = text.find("FFE08A").unwrap();
+        let after = text.find("</mark>").unwrap() + "</mark>".len();
+        assert_eq!(without_mark_tags(text, inside..after), "this **word**");
         let found = marks(text);
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].kind, MarkKind::Highlight);

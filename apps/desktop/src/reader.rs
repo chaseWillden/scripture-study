@@ -751,7 +751,7 @@ fn verse_reference(book: &str, chapter: u16, start: u16, end: u16) -> String {
     }
 }
 
-fn text_field(ui: &mut Ui, id: &str, text: &mut String, hint: &str, palette: &Palette) {
+pub(crate) fn text_field(ui: &mut Ui, id: &str, text: &mut String, hint: &str, palette: &Palette) {
     let frame = Frame::new()
         .fill(palette.menu_selected)
         .corner_radius(CornerRadius::same(8))
@@ -809,7 +809,7 @@ fn hit_row(ui: &mut Ui, hit: &VerseHit, selected: bool, palette: &Palette) -> bo
     response.clicked()
 }
 
-fn note(ui: &mut Ui, text: &str, palette: &Palette) {
+pub(crate) fn note(ui: &mut Ui, text: &str, palette: &Palette) {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
     ui.painter().text(
@@ -822,18 +822,18 @@ fn note(ui: &mut Ui, text: &str, palette: &Palette) {
 }
 
 /// Same title treatment as the notes sidebar.
-fn panel_heading(ui: &mut Ui, palette: &Palette, title: &str) {
+pub(crate) fn panel_heading(ui: &mut Ui, palette: &Palette, title: &str) {
     let galley = theme::semibold(ui, title, 17.0, palette.text);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
     let pos = rect.left_center() + vec2(18.0, -galley.size().y / 2.0);
     ui.painter().galley(pos, galley, palette.text);
 }
 
-fn escape_pressed(ui: &Ui) -> bool {
+pub(crate) fn escape_pressed(ui: &Ui) -> bool {
     !egui::Popup::is_any_open(ui.ctx()) && ui.input(|i| i.key_pressed(Key::Escape))
 }
 
-fn heading(ui: &mut Ui, palette: &Palette, title: &str, subtitle: Option<&str>) {
+pub(crate) fn heading(ui: &mut Ui, palette: &Palette, title: &str, subtitle: Option<&str>) {
     let galley = theme::semibold(ui, title, 28.0, palette.text);
     let (rect, _) =
         ui.allocate_exact_size(vec2(ui.available_width(), galley.size().y), Sense::hover());
@@ -852,7 +852,7 @@ fn heading(ui: &mut Ui, palette: &Palette, title: &str, subtitle: Option<&str>) 
 }
 
 /// Full-width row. The accessible name is always "Back"; `label` is what's drawn.
-fn back_row(ui: &mut Ui, palette: &Palette, label: &str) -> bool {
+pub(crate) fn back_row(ui: &mut Ui, palette: &Palette, label: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Back"));
     if response.hovered() {
@@ -870,7 +870,7 @@ fn back_row(ui: &mut Ui, palette: &Palette, label: &str) -> bool {
     response.clicked()
 }
 
-fn row(ui: &mut Ui, title: &str, selected: bool, palette: &Palette) -> bool {
+pub(crate) fn row(ui: &mut Ui, title: &str, selected: bool, palette: &Palette) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
     if selected || response.hovered() {
@@ -898,7 +898,7 @@ fn row(ui: &mut Ui, title: &str, selected: bool, palette: &Palette) -> bool {
     response.clicked()
 }
 
-fn section(ui: &mut Ui, title: &str, palette: &Palette) {
+pub(crate) fn section(ui: &mut Ui, title: &str, palette: &Palette) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
     ui.painter().text(
         pos2(rect.left() + 8.0, rect.center().y),
@@ -909,7 +909,7 @@ fn section(ui: &mut Ui, title: &str, palette: &Palette) {
     );
 }
 
-fn results_section(ui: &mut Ui, title: &str, palette: &Palette) {
+pub(crate) fn results_section(ui: &mut Ui, title: &str, palette: &Palette) {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
     ui.painter().text(

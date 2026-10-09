@@ -120,7 +120,7 @@ pub enum BarAction {
     Apply { kind: MarkKind, color: u32 },
     /// Take highlight and underline off the selection.
     Clear,
-    /// Copy the selected Markdown to the system clipboard.
+    /// Copy the selection. Highlight and underline tags are left out.
     Copy,
     /// Start moving the selected Markdown to a new page.
     MoveTo,

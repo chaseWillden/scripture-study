@@ -59,6 +59,7 @@ stays on the left with buttons to show notes, search, and create a new note.
 | ⌘K | Search all notes by title and content. ↑/↓ to move, Enter to open, Esc to close |
 | ⌘N | New note |
 | ⌘\\ or ⌘⇧B | Show/hide the sidebar (also the button next to the window controls) |
+| ⌘, | Open or close settings (also the gear at the bottom of the rail) |
 
 On Windows and Linux, use Ctrl instead of ⌘.
 
@@ -74,6 +75,50 @@ Markdown files stay organized on disk too.
   move it to the top level), or right-click it and choose **Move to**.
 - **Right-click a folder** to add a note to it, rename it, or delete it.
   Only empty folders can be deleted, so notes are never lost by accident.
+
+### Conference talks
+
+Click the microphone in the left rail to read and search general conference
+talks, from April 1971 through the latest conference.
+
+- **Download talks:** pick conferences (April or October), or click a year to
+  pick both of its conferences, then choose **Download**. Every talk in them is
+  fetched from churchofjesuschrist.org in the background, with progress shown
+  in the sidebar. Downloads are kept, so they also work offline, in
+  `.conference-talks` inside the platform data directory (for example,
+  `~/Library/Application Support/scripture-study/.conference-talks` on macOS).
+- **Search talks:** finds talks by title or speaker, then paragraphs that contain
+  every word you type. Put the query in quotes to match an exact phrase.
+  ↑/↓ to move, Enter to open. The talk opens on the matching paragraph.
+- **Browse:** pick a downloaded conference in the sidebar to see its sessions and
+  talks. Right-click it to remove the download.
+- ⌘F finds within the open talk. Esc steps back.
+
+### Settings and Google Drive sync
+
+The gear at the bottom of the left rail (or ⌘,) opens **Settings**. Its
+**Connectors** page holds the Google Drive connector. Turn it on, click
+**Connect**, and approve access in your browser. From then on every note is
+kept as a Google Doc in a Drive folder (**Scripture Study** unless you rename
+it), with your note folders mirrored inside it.
+
+- Sync is one way: from your notes to Drive. Edits made in Google Docs are
+  overwritten the next time that note changes.
+- A note syncs a few seconds after it's saved. **Sync now** syncs right away.
+- The top of each note says whether Drive has its latest version: **Synced**,
+  **Syncing**, or **Not synced** (hover for why).
+- Deleting or moving a note moves its old Doc to the Drive trash.
+- Frontmatter (tags, mentions, properties) and pictures are left out.
+- The app asks only for the `drive.file` permission, so it can see the files
+  it made and nothing else in your Drive.
+
+Signing in needs a Google OAuth client. Builds made with
+`SCRIPTURE_STUDY_GOOGLE_CLIENT_ID` (and `SCRIPTURE_STUDY_GOOGLE_CLIENT_SECRET`)
+set, at build or run time, use that client. Otherwise the connector asks for
+one: in Google Cloud Console, turn on the Google Drive API and create an
+OAuth client of type **Desktop app**. The sign-in and sync records are kept in
+`connectors.json` in the platform config directory (not in the notes folder),
+readable only by you.
 
 Notes save automatically half a second after you stop typing. Each note is one
 `.md` file in `$SCRIPTURE_STUDY_DIR`. If that isn't set, notes go to the platform data
@@ -106,6 +151,8 @@ crates/
     editor.rs       Editing operations (split, merge, shortcuts, slash query)
     commands.rs     Slash menu commands + fuzzy filtering
     search.rs       Full-text note search, snippets, relative times
+    talks.rs        Conference list, study-page HTML → talk text, talk search
+    drive_sync.rs   What to upload, update, or trash to mirror notes in a cloud folder
     selection.rs    Selections spanning blocks: copy, delete, replace, paste
     folders.rs      Folder tree for organizing notes
     store.rs        NoteStore trait + filesystem implementation (with folders)
@@ -113,7 +160,11 @@ apps/
   desktop/        egui/eframe desktop app (binary: `scripture-study`)
     src/app.rs      Note lifecycle, autosave, window layout, shortcuts
     src/editor.rs   Block editor widget + slash menu
-    src/sidebar.rs  Note list, search, new note
+    src/sidebar.rs  Note list, search, new note, and the icon rail
+    src/talks.rs    Conference talks page: picker, search, sessions, talk reader
+    src/talk_library.rs   Saved talks and the background download thread
+    src/settings_page.rs  Settings sections and the Connectors page
+    src/google_drive.rs   Google sign-in, the Drive API, and the background sync thread
     src/icons.rs    Line icons (painted, no icon font)
     src/theme.rs    Fonts, colors, Markdown → rich text layout
     src/app/tests.rs  Headless UI tests (egui_kittest)

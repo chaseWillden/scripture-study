@@ -48,20 +48,53 @@ pub fn compose(painter: &Painter, center: Pos2, color: Color32) {
     );
 }
 
-/// An open book.
+/// An open book: two pages that dip toward the spine.
 pub fn book(painter: &Painter, center: Pos2, color: Color32) {
     let stroke = Stroke::new(WIDTH, color);
     let p = |x: f32, y: f32| center + vec2(x, y);
+    for side in [-1.0, 1.0] {
+        painter.line(
+            vec![
+                p(0.0, -4.6),
+                p(side * 2.6, -6.0),
+                p(side * 5.4, -6.4),
+                p(side * 8.0, -6.0),
+                p(side * 8.0, 5.4),
+                p(side * 5.4, 5.0),
+                p(side * 2.6, 5.4),
+                p(0.0, 6.8),
+            ],
+            stroke,
+        );
+    }
+    painter.vline(center.x, center.y - 4.6..=center.y + 6.8, stroke);
+}
+
+/// A microphone on a stand ("conference talks").
+pub fn microphone(painter: &Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(WIDTH, color);
+    let p = |x: f32, y: f32| center + vec2(x, y);
+    let head = Rect::from_min_max(p(-3.0, -8.0), p(3.0, 2.0));
+    painter.rect_stroke(head, 3.0, stroke, StrokeKind::Middle);
+    let cradle: Vec<Pos2> = (0..=12)
+        .map(|n| {
+            let a = std::f32::consts::PI * (n as f32 / 12.0);
+            p(5.5 * a.cos(), -1.5 + 5.5 * a.sin())
+        })
+        .collect();
+    painter.line(cradle, stroke);
+    painter.vline(center.x, center.y + 4.0..=center.y + 7.5, stroke);
+    painter.hline(center.x - 3.5..=center.x + 3.5, center.y + 7.5, stroke);
+}
+
+/// An arrow down into a tray ("download").
+pub fn download(painter: &Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(WIDTH, color);
+    let p = |x: f32, y: f32| center + vec2(x, y);
+    painter.vline(center.x, center.y - 6.5..=center.y + 2.5, stroke);
+    painter.line(vec![p(-3.5, -1.0), p(0.0, 2.5), p(3.5, -1.0)], stroke);
     painter.line(
-        vec![
-            p(0.0, -6.2),
-            p(-7.2, -4.6),
-            p(-7.2, 5.4),
-            p(0.0, 7.0),
-            p(7.2, 5.4),
-            p(7.2, -4.6),
-            p(0.0, -6.2),
-        ],
+        vec![p(-6.5, 2.5), p(-6.5, 6.5), p(6.5, 6.5), p(6.5, 2.5)],
         stroke,
     );
 }
@@ -367,5 +400,81 @@ pub fn quote(painter: &Painter, center: Pos2, color: Color32) {
             ],
             stroke,
         );
+    }
+}
+
+/// A gear ("settings"): eight teeth around a hub.
+pub fn gear(painter: &Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(WIDTH, color);
+    let (inner, outer) = (5.6, 7.6);
+    let at = |degrees: f32, radius: f32| {
+        let a = degrees.to_radians();
+        center + vec2(a.cos(), a.sin()) * radius
+    };
+    let mut points = Vec::with_capacity(32);
+    for tooth in 0..8 {
+        let mid = tooth as f32 * 45.0;
+        points.extend([
+            at(mid - 15.0, inner),
+            at(mid - 8.0, outer),
+            at(mid + 8.0, outer),
+            at(mid + 15.0, inner),
+        ]);
+    }
+    painter.add(eframe::egui::Shape::closed_line(points, stroke));
+    painter.circle_stroke(center, 2.4, stroke);
+}
+
+/// A two-pronged plug ("connectors").
+pub fn plug(painter: &Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(WIDTH, color);
+    let p = |x: f32, y: f32| center + vec2(x, y);
+    painter.line_segment([p(-2.5, -7.0), p(-2.5, -3.5)], stroke);
+    painter.line_segment([p(2.5, -7.0), p(2.5, -3.5)], stroke);
+    painter.line(
+        vec![
+            p(-5.5, -3.5),
+            p(5.5, -3.5),
+            p(5.5, 0.0),
+            p(2.5, 3.5),
+            p(-2.5, 3.5),
+            p(-5.5, 0.0),
+            p(-5.5, -3.5),
+        ],
+        stroke,
+    );
+    painter.line_segment([p(0.0, 3.5), p(0.0, 7.0)], stroke);
+}
+
+/// The Google Drive triangle, in its own colors.
+pub fn drive(painter: &Painter, center: Pos2) {
+    let p = |x: f32, y: f32| center + vec2(x, y);
+    let (top, left, right) = (p(0.0, -8.0), p(-9.0, 6.5), p(9.0, 6.5));
+    let side = |from: Pos2, to: Pos2, color| {
+        painter.line_segment([from, to], Stroke::new(3.6, color));
+    };
+    side(top, left, Color32::from_rgb(0x0F, 0x9D, 0x58));
+    side(top, right, Color32::from_rgb(0xF4, 0xB4, 0x00));
+    side(left, right, Color32::from_rgb(0x42, 0x85, 0xF4));
+}
+
+/// A cloud, with a check inside once everything is up there.
+pub fn cloud(painter: &Painter, center: Pos2, color: Color32, checked: bool) {
+    let stroke = Stroke::new(WIDTH, color);
+    let p = |x: f32, y: f32| center + vec2(x, y);
+    // Two bumps on top of a flat base.
+    let mut points = Vec::new();
+    let arc = |points: &mut Vec<Pos2>, c: Pos2, r: f32, from: f32, to: f32| {
+        for step in 0..=8 {
+            let a = (from + (to - from) * step as f32 / 8.0).to_radians();
+            points.push(c + vec2(a.cos(), a.sin()) * r);
+        }
+    };
+    arc(&mut points, p(-4.0, 1.5), 3.0, 90.0, 230.0);
+    arc(&mut points, p(0.5, -0.5), 4.2, 200.0, 345.0);
+    arc(&mut points, p(4.5, 1.8), 2.7, 280.0, 450.0);
+    painter.add(eframe::egui::Shape::closed_line(points, stroke));
+    if checked {
+        painter.line(vec![p(-1.8, 1.2), p(-0.3, 2.6), p(2.2, -0.2)], stroke);
     }
 }

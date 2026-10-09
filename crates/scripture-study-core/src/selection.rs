@@ -7,6 +7,7 @@
 use crate::citations;
 use crate::document::{Block, BlockKind, Document, MAX_INDENT};
 use crate::editor::{char_to_byte, Caret};
+use crate::inline;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
@@ -70,24 +71,49 @@ impl Selection {
 
 /// The selected blocks, trimmed to the selection.
 fn slice(doc: &Document, selection: &Selection) -> Vec<Block> {
+    slice_blocks(doc, selection, false)
+}
+
+/// Like [`slice`], but highlight and underline tags are left out of the text.
+fn slice_visible(doc: &Document, selection: &Selection) -> Vec<Block> {
+    slice_blocks(doc, selection, true)
+}
+
+fn slice_blocks(doc: &Document, selection: &Selection, strip_marks: bool) -> Vec<Block> {
     let (start, end) = selection.range();
     (start.block..=end.block)
         .map(|i| {
             let block = &doc.blocks[i];
             let (from, to, _) = selection.in_block(doc, i).unwrap_or((0, 0, false));
-            let text = &block.text[char_to_byte(&block.text, from)..char_to_byte(&block.text, to)];
+            let bytes = char_to_byte(&block.text, from)..char_to_byte(&block.text, to);
+            let text = if strip_marks {
+                inline::without_mark_tags(&block.text, bytes)
+            } else {
+                block.text[bytes].to_string()
+            };
             Block::new(block.kind.clone(), text).indented(block.indent)
         })
         .collect()
 }
 
-/// The selection as Markdown, for the clipboard. Within one block this is
-/// just the raw text (inline syntax included). Across blocks, indents are
-/// relative to the shallowest selected block so a nested list pastes at the
-/// level of wherever it lands. Citation superscripts bring their sources
-/// along as footnote lines.
+/// The selection as Markdown. Within one block this is just the raw text
+/// (inline syntax included). Across blocks, indents are relative to the
+/// shallowest selected block so a nested list pastes at the level of
+/// wherever it lands. Citation superscripts bring their sources along as
+/// footnote lines. Highlight and underline tags stay, so moving a selection
+/// keeps its marks.
 pub fn to_markdown(doc: &Document, selection: &Selection) -> String {
-    let mut blocks = slice(doc, selection);
+    copied(doc, selection, slice(doc, selection))
+}
+
+/// The selection for the clipboard. The same text as [`to_markdown`], with
+/// highlight and underline tags removed so a paste elsewhere is the words
+/// on screen.
+pub fn to_clipboard(doc: &Document, selection: &Selection) -> String {
+    copied(doc, selection, slice_visible(doc, selection))
+}
+
+fn copied(doc: &Document, selection: &Selection, mut blocks: Vec<Block>) -> String {
     let body = if !selection.spans_blocks() {
         blocks.first().map(|b| b.text.clone()).unwrap_or_default()
     } else {
@@ -365,6 +391,25 @@ mod tests {
         );
         // Inside one block it's just the text.
         assert_eq!(to_markdown(&d, &Selection::new(c(0, 0), c(0, 3))), "Tit");
+    }
+
+    #[test]
+    fn clipboard_drops_mark_tags_and_markdown_keeps_them() {
+        let d = Document::from_markdown(
+            "And <u #FFE08A>inasmuch as ye shall prosper</u>, and <mark #8ED6A8>led</mark>[^1].\n\n[^1]: Tablets.\n",
+        );
+        let sel = Selection::all(&d);
+        assert_eq!(
+            to_clipboard(&d, &sel),
+            "And inasmuch as ye shall prosper, and led[^1].\n\n[^1]: Tablets."
+        );
+        let markdown = to_markdown(&d, &sel);
+        assert!(
+            markdown.contains("<u #FFE08A>inasmuch as ye shall prosper</u>"),
+            "{markdown}"
+        );
+        let partial = Selection::new(c(0, 0), c(0, "And <u #FF".len()));
+        assert_eq!(to_clipboard(&d, &partial), "And ");
     }
 
     #[test]

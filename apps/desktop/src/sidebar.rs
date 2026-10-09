@@ -19,7 +19,9 @@ use scripture_study_core::{
 
 use crate::icons;
 use crate::menu::{self, Item};
-use crate::shortcuts::{DELETE_NOTE, NEW_FOLDER, NEW_NOTE, RENAME, REVEAL, SEARCH, TOGGLE_SIDEBAR};
+use crate::shortcuts::{
+    DELETE_NOTE, NEW_FOLDER, NEW_NOTE, RENAME, REVEAL, SEARCH, SETTINGS, TOGGLE_SIDEBAR,
+};
 use crate::theme::{self, Palette};
 
 pub const DEFAULT_WIDTH: f32 = 248.0;
@@ -60,10 +62,14 @@ pub enum SidebarAction {
     MoveFolderOut(String),
     /// Show scriptures in the sidebar, in place of the notes list.
     OpenScriptures,
-    /// Leave scriptures and show the notes list.
+    /// Show conference talks in the sidebar, in place of the notes list.
+    OpenTalks,
+    /// Leave scriptures or settings and show the notes list.
     ShowNotes,
-    /// Leave scriptures and keep the sidebar view just chosen.
-    CloseScriptures,
+    /// Leave scriptures or settings and keep the sidebar view just chosen.
+    ClosePage,
+    /// Show settings in the sidebar and on the page.
+    OpenSettings,
 }
 
 pub const MOVE_OUT_LABEL: &str = "Move to location…";
@@ -76,6 +82,15 @@ pub const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
 } else {
     "Show in Files"
 };
+
+/// What fills the window beside the rail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    Notes,
+    Scriptures,
+    Talks,
+    Settings,
+}
 
 /// What the sidebar lists when it isn't searching.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,13 +406,8 @@ impl Sidebar {
     }
 
     /// The icon rail that stays visible when the sidebar is collapsed.
-    /// `scriptures` is true while the scriptures page is open.
-    pub fn rail(
-        &mut self,
-        ui: &mut Ui,
-        palette: &Palette,
-        scriptures: bool,
-    ) -> Option<SidebarAction> {
+    /// `page` is what the window shows beside it.
+    pub fn rail(&mut self, ui: &mut Ui, palette: &Palette, page: Page) -> Option<SidebarAction> {
         let mut action = None;
         let mut next = egui::pos2(ui.max_rect().center().x, ui.cursor().top() + 2.0);
         let mut button = |ui: &mut Ui, label, shortcut, active, icon| {
@@ -409,25 +419,29 @@ impl Sidebar {
             icon_button(ui, rect, label, shortcut, active, palette, icon).clicked()
         };
 
+        let scriptures = page == Page::Scriptures;
+        let talks = page == Page::Talks;
+        // Scriptures, talks, and settings replace the notes list, so the notes icons
+        // are not the current ones and clicking them switches back instead of
+        // collapsing.
+        let elsewhere = page != Page::Notes;
         let showing = |view| self.open && self.view == view && self.search.is_none();
-        // Scriptures replaces the notes list, so the notes icon is not the
-        // current one and clicking it switches back instead of collapsing.
-        let recent = showing(View::Recent) && !scriptures;
-        let organizing = showing(View::Folders) && !scriptures;
+        let recent = showing(View::Recent) && !elsewhere;
+        let organizing = showing(View::Folders) && !elsewhere;
         let label = if recent { "Hide notes" } else { "Show notes" };
         if button(ui, label, Some(TOGGLE_SIDEBAR), recent, icons::notes) {
-            if scriptures {
+            if elsewhere {
                 action = Some(SidebarAction::ShowNotes);
             } else {
                 self.switch_to(View::Recent);
             }
         }
         if button(ui, "Organize notes", None, organizing, icons::folder) {
-            if scriptures {
+            if elsewhere {
                 self.open = true;
                 self.view = View::Folders;
                 self.search = None;
-                action = Some(SidebarAction::CloseScriptures);
+                action = Some(SidebarAction::ClosePage);
             } else {
                 self.switch_to(View::Folders);
             }
@@ -443,15 +457,50 @@ impl Sidebar {
                 action = Some(SidebarAction::OpenScriptures);
             }
         }
-        let searching = self.open && self.search.is_some() && !scriptures;
+        if button(ui, "Conference talks", None, talks, icons::microphone) {
+            if talks && self.open {
+                self.open = false;
+            } else {
+                self.open = true;
+                self.search = None;
+                action = Some(SidebarAction::OpenTalks);
+            }
+        }
+        let searching = self.open && self.search.is_some() && !elsewhere;
         if button(ui, "Search notes", Some(SEARCH), searching, icons::search) {
             self.start_search();
-            if scriptures {
-                action = Some(SidebarAction::CloseScriptures);
+            if elsewhere {
+                action = Some(SidebarAction::ClosePage);
             }
         }
         if button(ui, "New note", Some(NEW_NOTE), false, icons::compose) {
             action = Some(SidebarAction::New);
+        }
+
+        // Settings sits at the foot of the rail, apart from the notes tools.
+        let settings = page == Page::Settings;
+        let foot = ui.max_rect().bottom() - 12.0 - RAIL_BUTTON / 2.0;
+        let rect = Rect::from_center_size(
+            egui::pos2(ui.max_rect().center().x, foot.max(next.y + RAIL_BUTTON)),
+            vec2(RAIL_BUTTON, RAIL_BUTTON),
+        );
+        let gear = icon_button(
+            ui,
+            rect,
+            "Settings",
+            Some(SETTINGS),
+            settings,
+            palette,
+            icons::gear,
+        );
+        if gear.clicked() {
+            if settings {
+                action = Some(SidebarAction::ClosePage);
+            } else {
+                self.open = true;
+                self.search = None;
+                action = Some(SidebarAction::OpenSettings);
+            }
         }
         ui.allocate_rect(ui.max_rect(), Sense::hover());
         action

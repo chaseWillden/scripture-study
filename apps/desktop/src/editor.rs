@@ -579,6 +579,23 @@ impl Editor {
         self.selection
     }
 
+    /// The selection as clipboard text. `across` is a document selection;
+    /// otherwise `start`..`end` is a range in block `block`. Mark tags are
+    /// left out. Citation sources come along.
+    fn copied_text(&self, across: bool, block: usize, start: usize, end: usize) -> String {
+        if across {
+            if let Some(sel) = self.selection {
+                return selection::to_clipboard(&self.doc, &sel);
+            }
+        }
+        let Some(block) = self.doc.blocks.get(block) else {
+            return String::new();
+        };
+        let (from, to) = (start.min(end), start.max(end));
+        let bytes = ops::char_to_byte(&block.text, from)..ops::char_to_byte(&block.text, to);
+        citations::with_definitions(&self.doc, &inline::without_mark_tags(&block.text, bytes))
+    }
+
     fn block_id(&self, index: usize) -> Id {
         Id::new(("block", &self.note_id, index))
     }
@@ -1366,9 +1383,8 @@ impl Editor {
                         });
                     }
                     BarAction::Copy => {
-                        if let Some(sel) = self.selection {
-                            ui.ctx().copy_text(selection::to_markdown(&self.doc, &sel));
-                        }
+                        ui.ctx()
+                            .copy_text(self.copied_text(selection, block, start, end));
                     }
                     BarAction::MoveTo => {
                         // Clicking the bar can return focus to the text field,
@@ -2110,9 +2126,9 @@ impl Editor {
         let mut op = None;
         for event in taken {
             match event {
-                egui::Event::Copy => ui.ctx().copy_text(selection::to_markdown(&self.doc, &sel)),
+                egui::Event::Copy => ui.ctx().copy_text(selection::to_clipboard(&self.doc, &sel)),
                 egui::Event::Cut => {
-                    ui.ctx().copy_text(selection::to_markdown(&self.doc, &sel));
+                    ui.ctx().copy_text(selection::to_clipboard(&self.doc, &sel));
                     op = Some(Op::DeleteSelection);
                 }
                 egui::Event::Text(text) | egui::Event::Paste(text) => {
@@ -3865,10 +3881,11 @@ mod outline_rebind_tests {
     }
 }
 
-/// Copy or cut inside one block. A superscript's source is not in the
-/// block's text, so the clipboard gets the selection plus its footnote
-/// lines. `Some(None)` means the copy was handled and there is nothing
-/// further to do.
+/// Copy or cut inside one block. The clipboard gets the words on screen:
+/// highlight and underline tags stay in the note, and a superscript's
+/// source comes along as a footnote line. `Some(None)` means the copy was
+/// handled and there is nothing further to do. A selection with neither
+/// marks nor citations is left for the text field.
 fn copy_citation(
     editor: &Editor,
     ui: &mut Ui,
@@ -3881,8 +3898,10 @@ fn copy_citation(
     }
     let (from, to) = (start.min(end), start.max(end));
     let text = &editor.doc.blocks[block].text;
-    let slice = &text[ops::char_to_byte(text, from)..ops::char_to_byte(text, to)];
-    let markdown = citations::with_definitions(&editor.doc, slice);
+    let bytes = ops::char_to_byte(text, from)..ops::char_to_byte(text, to);
+    let slice = &text[bytes.clone()];
+    let markdown =
+        citations::with_definitions(&editor.doc, &inline::without_mark_tags(text, bytes));
     if markdown == slice {
         return None;
     }

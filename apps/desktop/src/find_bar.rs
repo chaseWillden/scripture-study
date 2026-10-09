@@ -18,6 +18,8 @@ const BUTTON: f32 = 24.0;
 pub const NOTE_HINT: &str = "Find in note";
 /// Placeholder for the chapter find bar.
 pub const CHAPTER_HINT: &str = "Find in chapter";
+/// Placeholder for the talk find bar.
+pub const TALK_HINT: &str = "Find in talk";
 
 #[derive(Default)]
 pub struct FindBar {

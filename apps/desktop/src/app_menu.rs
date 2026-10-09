@@ -4,6 +4,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     OpenFolder,
+    Settings,
 }
 
 #[cfg(target_os = "macos")]
@@ -18,6 +19,7 @@ mod imp {
     };
 
     const OPEN_FOLDER: &str = "open-folder";
+    const SETTINGS: &str = "settings";
 
     /// Replaces the default menu bar with the app's.
     pub fn install(ctx: &egui::Context) {
@@ -27,11 +29,19 @@ mod imp {
             true,
             Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyO)),
         );
+        let settings = MenuItem::with_id(
+            SETTINGS,
+            "Settings…",
+            true,
+            Some(Accelerator::new(Some(Modifiers::SUPER), Code::Comma)),
+        );
         let app = Submenu::with_items(
             "Scripture Study",
             true,
             &[
                 &PredefinedMenuItem::about(None, None),
+                &PredefinedMenuItem::separator(),
+                &settings,
                 &PredefinedMenuItem::separator(),
                 &PredefinedMenuItem::services(None),
                 &PredefinedMenuItem::separator(),
@@ -55,8 +65,13 @@ mod imp {
         // Menu clicks don't wake egui on their own.
         let ctx = ctx.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if event.id.as_ref() == OPEN_FOLDER {
-                CHOSEN.lock().unwrap().push(Command::OpenFolder);
+            let command = match event.id.as_ref() {
+                OPEN_FOLDER => Some(Command::OpenFolder),
+                SETTINGS => Some(Command::Settings),
+                _ => None,
+            };
+            if let Some(command) = command {
+                CHOSEN.lock().unwrap().push(command);
             }
             ctx.request_repaint();
         }));

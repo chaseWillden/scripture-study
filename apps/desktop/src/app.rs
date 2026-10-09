@@ -1,11 +1,13 @@
 //! Note lifecycle (which note is open, autosave, note commands) and the
-//! window layout: title bar, sidebar, editor, and the scriptures page.
+//! window layout: title bar, sidebar, editor, and the scriptures,
+//! conference talks, and settings pages.
 
 use std::time::SystemTime;
 
 use eframe::egui::{self, pos2, vec2, Frame, Rect, UiBuilder};
 use scripture_study_core::{
     commands::{self, Action, Command},
+    drive_sync::LocalNote,
     editor::Caret,
     folders::{self, Folder},
     search::IndexedNote,
@@ -16,13 +18,17 @@ use scripture_study_core::{
 };
 
 use crate::editor::{Editor, Event};
+use crate::google_drive::GoogleDrive;
 use crate::meta::NoteTimes;
 use crate::reader::Reader;
+use crate::settings_page::SettingsPage;
 use crate::shortcuts::{
-    DELETE_NOTE, FIND, NEW_FOLDER, NEW_NOTE, OPEN_FOLDER, RENAME, REVEAL, SAVE, SEARCH,
+    DELETE_NOTE, FIND, NEW_FOLDER, NEW_NOTE, OPEN_FOLDER, RENAME, REVEAL, SAVE, SEARCH, SETTINGS,
     TOGGLE_SIDEBAR, TOGGLE_SIDEBAR_SHIFT_B,
 };
-use crate::sidebar::{self, Sidebar, SidebarAction};
+use crate::sidebar::{self, Page, Sidebar, SidebarAction};
+use crate::talk_library::TalkLibrary;
+use crate::talks::TalksPage;
 use crate::theme::{self, Palette};
 
 /// Height of the strip at the top of the window that holds the window
@@ -56,6 +62,14 @@ pub struct ScriptureStudyApp {
     current: String,
     sidebar: Sidebar,
     scriptures: Reader,
+    talks: TalksPage,
+    /// Downloaded conference talks, and the thread that fetches more.
+    talk_library: TalkLibrary,
+    settings: SettingsPage,
+    /// Copies notes to Google Drive when that connector is on.
+    drive: GoogleDrive,
+    /// Sync hash of the open note as saved, to tell whether Drive has it.
+    saved_hash: String,
     editor: Editor,
     commands: Vec<Command>,
     /// egui time of the first unsaved edit.
@@ -93,6 +107,27 @@ impl ScriptureStudyApp {
             None => store.create()?,
         };
         let doc = store.load(&current)?;
+        // Tests never read or write the real connector settings.
+        let config = if cfg!(test) {
+            None
+        } else {
+            crate::google_drive::config_file()
+        };
+        let drive = GoogleDrive::start(config, store.root().to_path_buf(), cc.egui_ctx.clone());
+        // Tests never touch the network or the real downloads.
+        let talk_library = if cfg!(test) {
+            TalkLibrary::start(
+                None,
+                std::sync::Arc::new(|_: &str| Err("offline".to_string())),
+                cc.egui_ctx.clone(),
+            )
+        } else {
+            TalkLibrary::start(
+                crate::talk_library::dir(),
+                crate::talk_library::web(),
+                cc.egui_ctx.clone(),
+            )
+        };
         let mut app = Self {
             store,
             notes,
@@ -102,6 +137,11 @@ impl ScriptureStudyApp {
             current,
             sidebar: Sidebar::default(),
             scriptures: Reader::default(),
+            talks: TalksPage::default(),
+            talk_library,
+            settings: SettingsPage::default(),
+            drive,
+            saved_hash: String::new(),
             commands: Vec::new(),
             dirty_since: None,
             error: None,
@@ -116,6 +156,7 @@ impl ScriptureStudyApp {
             spelling: crate::spell::Spelling::new(),
         };
         app.load_outline();
+        app.rehash();
         app.refresh_notes();
         Ok(app)
     }
@@ -203,8 +244,16 @@ impl ScriptureStudyApp {
             return;
         }
         self.error = None;
+        self.rehash();
         self.refresh_notes();
         self.flush_outline();
+        self.drive.notes_changed();
+    }
+
+    /// Records what the open note looks like on disk, for its sync badge.
+    /// Call after the editor's note is loaded or saved.
+    fn rehash(&mut self) {
+        self.saved_hash = LocalNote::new(&self.current, &self.editor.doc).hash;
     }
 
     /// Saves the open note (or discards it if it's empty) and opens another.
@@ -225,9 +274,11 @@ impl ScriptureStudyApp {
                 self.editor = Editor::new(&id, doc);
                 self.sidebar.reveal(store::parent(&id));
                 self.scriptures.close();
+                self.settings.close();
                 self.current = id;
                 self.outline_dirty_since = None;
                 self.load_outline();
+                self.rehash();
             }
             Err(e) => self.error = Some(format!("Couldn't open note: {e}")),
         }
@@ -256,6 +307,7 @@ impl ScriptureStudyApp {
             self.error = Some(format!("Couldn't delete note: {e}"));
             return;
         }
+        self.drive.notes_changed();
         if id != self.current {
             self.refresh_notes();
             return;
@@ -299,7 +351,21 @@ impl ScriptureStudyApp {
             meta.map(|note| note.modified)
                 .unwrap_or_else(SystemTime::now)
         };
-        NoteTimes { created, updated }
+        // A blank note isn't sent anywhere, so it has nothing to show.
+        let sync = if self.editor.doc.is_blank() {
+            None
+        } else {
+            let saved = self
+                .dirty_since
+                .is_none()
+                .then_some(self.saved_hash.as_str());
+            self.drive.note_status(&self.current, saved)
+        };
+        NoteTimes {
+            created,
+            updated,
+            sync,
+        }
     }
 
     fn title(&self) -> String {
@@ -343,7 +409,31 @@ impl ScriptureStudyApp {
     }
 
     fn window_title(&self) -> String {
-        self.scriptures.title().unwrap_or_else(|| self.title())
+        self.settings
+            .title()
+            .or_else(|| self.scriptures.title())
+            .or_else(|| self.talks.title(&self.talk_library))
+            .unwrap_or_else(|| self.title())
+    }
+
+    /// What fills the window beside the rail.
+    fn page(&self) -> Page {
+        if self.settings.is_open() {
+            Page::Settings
+        } else if self.scriptures.is_open() {
+            Page::Scriptures
+        } else if self.talks.is_open() {
+            Page::Talks
+        } else {
+            Page::Notes
+        }
+    }
+
+    /// Back to the open note, keeping whatever the sidebar shows.
+    fn close_pages(&mut self) {
+        self.scriptures.close();
+        self.talks.close();
+        self.settings.close();
     }
 }
 
@@ -358,7 +448,7 @@ impl ScriptureStudyApp {
         }
         if !menu_open && ui.input_mut(|i| i.consume_shortcut(&NEW_FOLDER)) {
             self.sidebar.new_folder();
-            self.scriptures.close();
+            self.close_pages();
         }
         // ⌥⌘R before ⌘R, which also matches with Option held.
         if !menu_open && ui.input_mut(|i| i.consume_shortcut(&REVEAL)) {
@@ -376,23 +466,32 @@ impl ScriptureStudyApp {
         }
         if ui.input_mut(|i| i.consume_shortcut(&SEARCH)) {
             self.sidebar.start_search();
-            self.scriptures.close();
+            self.close_pages();
         }
         // Cmd+F finds within the open note, or the open chapter on the
         // scriptures page. Cmd+K searches every note.
         if ui.input_mut(|i| i.consume_shortcut(&FIND)) {
-            if self.scriptures.is_open() {
-                self.scriptures.open_find();
-            } else {
-                self.editor.find.open();
+            match self.page() {
+                Page::Scriptures => self.scriptures.open_find(),
+                Page::Talks => self.talks.open_find(),
+                Page::Notes => self.editor.find.open(),
+                Page::Settings => {}
             }
         }
-        // On macOS the menu bar takes ⌘O and reports it here.
-        let open_folder =
-            !cfg!(target_os = "macos") && ui.input_mut(|i| i.consume_shortcut(&OPEN_FOLDER));
-        if open_folder || crate::app_menu::chosen().contains(&crate::app_menu::Command::OpenFolder)
-        {
+        // On macOS the menu bar takes ⌘O and ⌘, and reports them here.
+        let chosen = crate::app_menu::chosen();
+        let mac = cfg!(target_os = "macos");
+        let open_folder = !mac && ui.input_mut(|i| i.consume_shortcut(&OPEN_FOLDER));
+        if open_folder || chosen.contains(&crate::app_menu::Command::OpenFolder) {
             self.choose_library();
+        }
+        let settings = !mac && ui.input_mut(|i| i.consume_shortcut(&SETTINGS));
+        if settings || chosen.contains(&crate::app_menu::Command::Settings) {
+            self.sidebar_action(if self.settings.is_open() {
+                SidebarAction::ClosePage
+            } else {
+                SidebarAction::OpenSettings
+            });
         }
         if !menu_open && ui.input_mut(|i| i.consume_shortcut(&NEW_NOTE)) {
             self.run(Action::NewNote);
@@ -413,7 +512,8 @@ impl ScriptureStudyApp {
             .frame(Frame::new().fill(palette.rail))
             .show(ui, |ui| {
                 ui.add_space(TITLEBAR_HEIGHT);
-                self.sidebar.rail(ui, palette, self.scriptures.is_open())
+                let page = self.page();
+                self.sidebar.rail(ui, palette, page)
             })
             .inner;
         if let Some(action) = action {
@@ -434,8 +534,14 @@ impl ScriptureStudyApp {
             .frame(Frame::new().fill(palette.sidebar))
             .show_collapsible(ui, &mut expanded, |ui| {
                 ui.add_space(TITLEBAR_HEIGHT);
-                if self.scriptures.is_open() {
+                if self.settings.is_open() {
+                    self.settings.show_index(ui, palette);
+                    None
+                } else if self.scriptures.is_open() {
                     self.scriptures.show_index(ui, palette);
+                    None
+                } else if self.talks.is_open() {
+                    self.talks.show_index(ui, palette, &mut self.talk_library);
                     None
                 } else {
                     let title = self.title();
@@ -474,16 +580,31 @@ impl ScriptureStudyApp {
                 return;
             }
             SidebarAction::OpenScriptures => {
+                self.settings.close();
+                self.talks.close();
                 self.scriptures.ensure_open();
                 return;
             }
-            SidebarAction::ShowNotes => {
+            SidebarAction::OpenTalks => {
+                self.settings.close();
                 self.scriptures.close();
+                self.talks.ensure_open();
+                return;
+            }
+            SidebarAction::OpenSettings => {
+                self.scriptures.close();
+                self.talks.close();
+                self.settings.open();
+                self.sidebar.open = true;
+                return;
+            }
+            SidebarAction::ShowNotes => {
+                self.close_pages();
                 self.sidebar.show_recent();
                 return;
             }
-            SidebarAction::CloseScriptures => {
-                self.scriptures.close();
+            SidebarAction::ClosePage => {
+                self.close_pages();
                 return;
             }
             SidebarAction::NewIn(folder) => self.store.create_in(&folder).map(|id| self.open(id)),
@@ -534,6 +655,7 @@ impl ScriptureStudyApp {
             Err(e) => self.error = Some(e.to_string()),
         }
         self.refresh_notes();
+        self.drive.notes_changed();
     }
 
     /// Retitles a note by rewriting its title line.
@@ -594,7 +716,9 @@ impl ScriptureStudyApp {
         self.dirty_since = None;
         self.outline_dirty_since = None;
         self.load_outline();
+        self.rehash();
         self.sidebar.forget_notes();
+        self.drive.set_library(dir.clone());
         self.error = (self.remember_library)(&dir)
             .err()
             .map(|e| format!("Couldn't remember the folder: {e}"));
@@ -619,7 +743,10 @@ impl ScriptureStudyApp {
             return;
         };
         match move_to(&self.store, &dest) {
-            Ok(_) => self.error = None,
+            Ok(_) => {
+                self.error = None;
+                self.drive.notes_changed();
+            }
             Err(e) => {
                 self.error = Some(format!("Couldn't move: {e}"));
                 return;
@@ -662,6 +789,36 @@ impl ScriptureStudyApp {
             });
             let top_right = pos2(full.right() - 16.0, full.top() + TITLEBAR_HEIGHT + 4.0);
             self.scriptures.show_find_bar(ui.ctx(), top_right, palette);
+        });
+    }
+
+    fn show_talks(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            ui.painter()
+                .rect_filled(ui.max_rect(), 0.0, palette.background);
+            let full = ui.max_rect();
+            let mut column = self.page_column(ui, full);
+            column.min.y = full.top() + TITLEBAR_HEIGHT + 16.0;
+            column.max.y = full.bottom();
+            ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
+                self.talks.show_page(ui, palette, &mut self.talk_library);
+            });
+            let top_right = pos2(full.right() - 16.0, full.top() + TITLEBAR_HEIGHT + 4.0);
+            self.talks.show_find_bar(ui.ctx(), top_right, palette);
+        });
+    }
+
+    fn show_settings(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            ui.painter()
+                .rect_filled(ui.max_rect(), 0.0, palette.background);
+            let full = ui.max_rect();
+            let mut column = self.page_column(ui, full);
+            column.min.y = full.top() + TITLEBAR_HEIGHT + 36.0;
+            column.max.y = full.bottom();
+            ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
+                self.settings.show_page(ui, palette, &self.drive);
+            });
         });
     }
 
@@ -895,20 +1052,32 @@ impl eframe::App for ScriptureStudyApp {
         let palette = Palette::for_ui(ui);
         let title_before = self.window_title();
 
+        if self.talk_library.poll() {
+            self.talks.library_changed();
+        }
         self.shortcuts(ui);
-        if !self.scriptures.is_open() {
+        if self.page() == Page::Notes {
             self.add_images(ui);
         }
         self.show_rail(ui, &palette);
         self.show_sidebar(ui, &palette);
-        let events = if self.scriptures.is_open() {
-            self.show_scriptures(ui, &palette);
-            Vec::new()
-        } else {
-            self.show_editor(ui, &palette)
+        let events = match self.page() {
+            Page::Settings => {
+                self.show_settings(ui, &palette);
+                Vec::new()
+            }
+            Page::Scriptures => {
+                self.show_scriptures(ui, &palette);
+                Vec::new()
+            }
+            Page::Talks => {
+                self.show_talks(ui, &palette);
+                Vec::new()
+            }
+            Page::Notes => self.show_editor(ui, &palette),
         };
         self.title_bar(ui, &palette);
-        if !self.scriptures.is_open() {
+        if self.page() == Page::Notes {
             self.drop_hint(ui, &palette);
         }
 

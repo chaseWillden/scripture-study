@@ -33,3 +33,5 @@ pub const REVEAL: KeyboardShortcut = KeyboardShortcut::new(command(false, true),
 pub const RENAME: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
 /// Check before [`NEW_NOTE`], which also matches with Shift held.
 pub const NEW_FOLDER: KeyboardShortcut = KeyboardShortcut::new(command(true, false), Key::N);
+/// The usual place for an app's settings on every platform.
+pub const SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);

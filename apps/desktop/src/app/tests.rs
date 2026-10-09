@@ -582,7 +582,13 @@ fn collapsed_sidebar_keeps_the_icon_rail() {
     f.click("Hide notes");
     assert!(!f.app().sidebar.open);
     assert!(f.harness.query_by_label("Groceries").is_none());
-    for label in ["Show notes", "Scriptures", "Search notes", "New note"] {
+    for label in [
+        "Show notes",
+        "Scriptures",
+        "Conference talks",
+        "Search notes",
+        "New note",
+    ] {
         assert!(f.harness.query_by_label(label).is_some(), "{label} missing");
     }
     f.snapshot("rail_collapsed");
@@ -3219,6 +3225,37 @@ fn opening_a_folder_loads_annotations() {
 }
 
 #[test]
+fn copying_highlighted_text_leaves_the_mark_tags_in_the_note() {
+    let raw = "And <u #FFE08A>inasmuch as ye shall prosper</u>, and <u #8ED6A8>shall be led</u>.";
+    let mut f = Fixture::with_note(&format!("{raw}\n"));
+    f.shortcut(Key::A);
+    let copied = clipboard_after(&mut f, egui::Event::Copy).unwrap();
+    assert_eq!(
+        copied,
+        "And inasmuch as ye shall prosper, and shall be led."
+    );
+    assert_eq!(f.texts(), [raw]);
+
+    // A selection inside the paragraph, crossing a tag, takes the same path
+    // as the text field rather than the document selection.
+    f.press(Key::Escape);
+    let n = raw.chars().count();
+    for _ in 0..n {
+        f.shortcut_mods(egui::Modifiers::SHIFT, Key::ArrowLeft);
+    }
+    assert!(
+        selection(&f).is_none(),
+        "the selection stays in the paragraph"
+    );
+    let copied = clipboard_after(&mut f, egui::Event::Copy).unwrap();
+    assert_eq!(
+        copied,
+        "And inasmuch as ye shall prosper, and shall be led."
+    );
+    assert_eq!(f.texts(), [raw]);
+}
+
+#[test]
 fn selecting_text_shows_the_highlight_bar() {
     let mut f = Fixture::with_note("hope\n");
     for _ in 0.."hope".len() {
@@ -3277,4 +3314,288 @@ fn moving_selected_text_cuts_it_from_source_and_inserts_it_into_destination() {
         destination.contains("Existing text.\n\nMove this text."),
         "{destination}"
     );
+}
+
+#[test]
+fn settings_sits_at_the_foot_of_the_rail_and_opens_connectors() {
+    let mut f = Fixture::with_note("# Note\n\nKeep me.\n");
+    let gear = f.harness.get_by_label("Settings").rect();
+    let search = f.harness.get_by_label("Search notes").rect();
+    assert!(gear.bottom() > 640.0 - 24.0, "at the foot: {gear:?}");
+    assert!((gear.center().x - search.center().x).abs() < 0.5);
+
+    f.click("Settings");
+    assert!(f.app().settings.is_open());
+    assert!(f.harness.query_by_label("Connectors").is_some());
+    assert!(f.harness.query_by_label("Google Drive").is_some());
+    // Notes are no longer the current rail item.
+    assert!(f.harness.query_by_label("Show notes").is_some());
+    f.snapshot("settings_connectors");
+
+    // Typing stays out of the note underneath.
+    f.type_text("hello");
+    assert_eq!(f.texts(), ["Note", "Keep me."]);
+
+    // The gear closes it again, as does Escape.
+    f.click("Settings");
+    assert!(!f.app().settings.is_open());
+    f.click("Settings");
+    f.press(Key::Escape);
+    assert!(!f.app().settings.is_open());
+
+    // Settings and scriptures take turns on the page.
+    f.click("Settings");
+    f.click("Scriptures");
+    assert!(f.app().scriptures.is_open());
+    assert!(!f.app().settings.is_open());
+    f.click("Settings");
+    assert!(!f.app().scriptures.is_open());
+    assert!(f.app().settings.is_open());
+
+    // Any of the notes tools goes back to the note.
+    f.click("Show notes");
+    assert!(!f.app().settings.is_open());
+    assert_eq!(f.texts(), ["Note", "Keep me."]);
+}
+
+#[test]
+fn opening_a_note_leaves_settings() {
+    let mut f = Fixture::with_notes(&[("a", "# Alpha\n"), ("b", "# Beta\n")]);
+    f.click("Settings");
+    f.click("New note");
+    assert!(!f.app().settings.is_open());
+    assert_eq!(f.texts(), [""]);
+}
+
+#[test]
+fn turning_on_google_drive_asks_for_a_client_then_an_account() {
+    let mut f = Fixture::new();
+    f.click("Settings");
+    assert!(f.harness.query_by_label("Not connected").is_none());
+
+    f.click("Google Drive");
+    assert!(f.app().drive.snapshot().enabled);
+    assert!(f.harness.query_by_label("Not connected").is_some());
+    assert!(f.harness.query_by_label("Client ID").is_some());
+    // Nothing to sign in with until there's a client.
+    let connect = f.harness.get_by_label("Connect");
+    assert!(egui_kittest::kittest::NodeT::accesskit_node(&connect).is_disabled());
+    f.snapshot("settings_google_drive");
+
+    // Off again hides the details.
+    f.click("Google Drive");
+    assert!(!f.app().drive.snapshot().enabled);
+    assert!(f.harness.query_by_label("Not connected").is_none());
+}
+
+#[test]
+fn each_note_shows_whether_google_drive_has_it() {
+    use crate::google_drive::{Phase, Snapshot};
+    use scripture_study_core::{drive_sync::LocalNote, Document};
+
+    let markdown = "# Note\n\nKeep me.\n";
+    let mut f = Fixture::with_note(markdown);
+    // The connector is off: no badge.
+    assert!(f.harness.query_by_label("Synced to Google Drive").is_none());
+    assert!(f
+        .harness
+        .query_by_label("Not synced to Google Drive")
+        .is_none());
+
+    // Drive has exactly what's on disk.
+    let hash = LocalNote::new("note", &Document::from_markdown(markdown)).hash;
+    let synced = Snapshot {
+        enabled: true,
+        connected: true,
+        notes: std::sync::Arc::new([("note".to_string(), hash)].into()),
+        ..Snapshot::default()
+    };
+    f.app().drive.set_snapshot(synced.clone());
+    f.harness.run();
+    assert!(f.harness.query_by_label("Synced to Google Drive").is_some());
+    f.snapshot("note_synced");
+
+    // An edit that Drive hasn't seen.
+    f.type_text("!");
+    assert!(f.harness.query_by_label("Synced to Google Drive").is_none());
+    assert!(f
+        .harness
+        .query_by_label("Not synced to Google Drive")
+        .is_some());
+    f.snapshot("note_not_synced");
+
+    // While a sync runs, and after one fails.
+    f.app().drive.set_snapshot(Snapshot {
+        phase: Phase::Syncing { done: 0, total: 1 },
+        ..synced.clone()
+    });
+    f.harness.run();
+    assert!(f
+        .harness
+        .query_by_label("Syncing to Google Drive")
+        .is_some());
+    f.app().drive.set_snapshot(Snapshot {
+        error: Some("Google Drive 403: quota".into()),
+        ..synced
+    });
+    f.harness.run();
+    assert!(f
+        .harness
+        .query_by_label("Not synced to Google Drive")
+        .is_some());
+}
+
+fn sample_conference() -> scripture_study_core::talks::ConferenceTalks {
+    use scripture_study_core::talks::{Conference, ConferenceTalks, Paragraph, Session, Talk};
+    let talk = |slug: &str, title: &str, speaker: &str, paragraphs: &[&str]| Talk {
+        uri: format!("/general-conference/2024/10/{slug}"),
+        title: title.into(),
+        speaker: speaker.into(),
+        role: "Of the Quorum of the Twelve Apostles".into(),
+        kicker: format!("A talk about {title}."),
+        paragraphs: paragraphs
+            .iter()
+            .map(|text| Paragraph {
+                text: text.to_string(),
+                heading: false,
+            })
+            .collect(),
+    };
+    ConferenceTalks {
+        conference: Conference::october(2024),
+        sessions: vec![
+            Session {
+                title: "Saturday Morning Session".into(),
+                talks: vec![talk(
+                    "12andersen",
+                    "The Triumph of Hope",
+                    "Elder Neil L. Andersen",
+                    &[
+                        "Hope is a living gift.",
+                        "Faith, hope, and charity go together.",
+                    ],
+                )],
+            },
+            Session {
+                title: "Sunday Afternoon Session".into(),
+                talks: vec![talk(
+                    "54cook",
+                    "Sacred Scriptures",
+                    "Elder Quentin L. Cook",
+                    &["The scriptures are a foundation of faith."],
+                )],
+            },
+        ],
+    }
+}
+
+#[test]
+fn conference_talks_search_and_open_a_talk() {
+    let mut f = Fixture::with_note("# Note\n\nKeep me.\n");
+    f.click("Conference talks");
+    assert_eq!(f.app().page(), crate::sidebar::Page::Talks);
+    assert!(f.harness.query_by_label("Nothing downloaded yet").is_some());
+    assert!(f.harness.query_by_label("Choose conferences").is_some());
+
+    f.harness
+        .state_mut()
+        .talk_library
+        .insert(sample_conference());
+    f.harness.state_mut().talks.library_changed();
+    f.harness.run();
+    assert!(f.harness.query_by_label("October 2024").is_some());
+
+    f.harness
+        .get_by(|node| node.placeholder() == Some("Search talks"))
+        .click();
+    f.harness.run();
+    f.type_text("charity");
+    assert!(f.harness.query_by_label("Results (1)").is_some());
+    f.press(Key::Enter);
+    assert_eq!(f.app().window_title(), "The Triumph of Hope");
+    assert!(f
+        .harness
+        .query_by_label("Faith, hope, and charity go together.")
+        .is_some());
+    f.snapshot("conference_talk");
+
+    // Escape steps back to the conference, which lists every session.
+    f.press(Key::Escape);
+    assert_eq!(f.app().window_title(), "October 2024");
+    assert!(f.harness.query_by_label("The Triumph of Hope").is_some());
+    f.click("Sacred Scriptures");
+    assert_eq!(f.app().window_title(), "Sacred Scriptures");
+    f.click("Back");
+    assert_eq!(f.app().window_title(), "October 2024");
+
+    // A speaker's name finds their talk by title.
+    f.click("Search talks");
+    // The field and its text both carry the query.
+    f.harness
+        .get_all_by(|node| node.value().as_deref() == Some("charity"))
+        .next()
+        .unwrap()
+        .click();
+    f.harness.run();
+    for _ in 0.."charity".len() {
+        f.press(Key::Backspace);
+    }
+    f.type_text("cook");
+    assert!(f.harness.query_by_label("Sacred Scriptures").is_some());
+    assert!(f.harness.query_by_label("The Triumph of Hope").is_none());
+    assert_eq!(f.texts(), ["Note", "Keep me."]);
+}
+
+#[test]
+fn conference_talks_picker_queues_years_and_conferences() {
+    let mut f = Fixture::new();
+    f.click("Conference talks");
+    f.click("Download talks");
+    f.harness
+        .state_mut()
+        .talk_library
+        .insert(sample_conference());
+    f.harness.run();
+
+    f.click("April 2024");
+    assert!(f.harness.query_by_label("Download 1 conference").is_some());
+    // The year picks both of its conferences; October 2024 is already here.
+    f.click("2023");
+    assert!(f.harness.query_by_label("Download 3 conferences").is_some());
+    f.click("2023");
+    assert!(f.harness.query_by_label("Download 1 conference").is_some());
+    f.click("2023");
+    f.snapshot("conference_talks_picker");
+
+    // Tests are offline, so the download fails and says why.
+    f.click("Download 3 conferences");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let failed = |f: &Fixture| {
+        f.harness
+            .query_by(|node| {
+                node.value()
+                    .is_some_and(|text| text.starts_with("Couldn’t download April 2024"))
+            })
+            .is_some()
+    };
+    while !failed(&f) || f.app().talk_library.status().is_busy() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "download never failed: {:?}",
+            f.app().talk_library.status()
+        );
+        thread::sleep(Duration::from_millis(20));
+        // The download thread's repaint request doesn't make `run` draw.
+        f.harness.step();
+        f.harness.run();
+    }
+    assert_eq!(f.app().talk_library.conferences().len(), 1);
+    // A downloaded conference opens from the picker.
+    f.harness
+        .get_all_by_label("October 2024")
+        .last()
+        .unwrap()
+        .click();
+    f.harness.run();
+    assert_eq!(f.app().window_title(), "October 2024");
 }

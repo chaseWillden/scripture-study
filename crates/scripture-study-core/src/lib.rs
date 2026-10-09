@@ -6,6 +6,7 @@
 pub mod citations;
 pub mod commands;
 pub mod document;
+pub mod drive_sync;
 pub mod editor;
 pub mod find;
 pub mod folders;
@@ -20,6 +21,7 @@ pub mod selection;
 pub mod settings;
 pub mod spell;
 pub mod store;
+pub mod talks;
 mod time;
 
 pub use document::{Block, BlockKind, Document};

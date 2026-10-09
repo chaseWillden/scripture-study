@@ -223,6 +223,25 @@ pub fn semibold(ui: &egui::Ui, text: &str, size: f32, color: Color32) -> Arc<egu
         .layout_job(LayoutJob::single_section(text.to_string(), format))
 }
 
+/// Inter SemiBold wrapped to `width`.
+pub fn semibold_wrapped(
+    ui: &egui::Ui,
+    text: &str,
+    size: f32,
+    color: Color32,
+    width: f32,
+) -> Arc<egui::Galley> {
+    let format = TextFormat {
+        font_id: FontId::proportional(size),
+        coords: weight(600.0),
+        color,
+        ..Default::default()
+    };
+    let mut job = LayoutJob::single_section(text.to_string(), format);
+    job.wrap.max_width = width;
+    ui.painter().layout_job(job)
+}
+
 fn weight(w: f32) -> VariationCoords {
     VariationCoords::new([(b"wght", w)])
 }
